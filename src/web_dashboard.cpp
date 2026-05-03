@@ -11,6 +11,9 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <memory>
+#include <vector>
+#include <functional>
 
 namespace honeyopus {
 
@@ -150,34 +153,44 @@ static String fmt_ts(time_t t) {
     return String(buf);
 }
 
-// ----------- pages ------------
+// ---------- chunked response helper ----------
+//
+// AsyncResponseStream/String-based responses buffer the *entire* page in a
+// growing cbuf in RAM until req->send() — for big pages (dashboard with 50
+// rows, config with accordions+modal) that easily exceeds the free heap on
+// ESP32-C3, throws std::bad_alloc inside the parser and __terminate aborts.
+//
+// beginChunkedResponse() instead asks our callback for ~1.4 KB at a time and
+// writes each chunk straight to TCP, so peak heap is bounded.
+//
+// We model each page as a list of String segments and drain them across
+// callback invocations.
+struct SegPage {
+    std::vector<String> segs;
+    size_t seg_idx = 0;
+    size_t pos = 0;     // bytes already copied from segs[seg_idx]
+};
 
-// Renders an "initialization in progress" banner if any subsystem isn't ready
-// yet. Returns true if it added anything to the stream.
-static bool render_init_banner(AsyncResponseStream* s) {
-    bool ssh_enabled = g_config.get().ssh_enabled;
-    bool ssh_ready   = ssh_listener_running();
-    bool wifi_ok     = wifi_mode() == NetMode::OnlineSTA;
-    if (ssh_enabled && !ssh_ready) {
-        s->print("<div class='card' style='border-left:4px solid #f0b429'>");
-        s->print("<b>HoneyOpus is still initializing.</b> ");
-        if (!ssh_hostkey_ready()) {
-            s->print("Generating the SSH host key on first boot &mdash; this normally takes ~30 s on ESP32-C3. ");
-        } else {
-            s->print("SSH host key ready, the listener is binding. ");
+static AwsResponseFiller make_seg_filler(std::shared_ptr<SegPage> p) {
+    return [p](uint8_t* buf, size_t maxLen, size_t /*index*/) -> size_t {
+        size_t written = 0;
+        while (written < maxLen && p->seg_idx < p->segs.size()) {
+            const String& s = p->segs[p->seg_idx];
+            size_t avail = s.length() - p->pos;
+            if (avail == 0) { p->seg_idx++; p->pos = 0; continue; }
+            size_t take = std::min(avail, maxLen - written);
+            memcpy(buf + written, s.c_str() + p->pos, take);
+            written += take;
+            p->pos += take;
+            if (p->pos == s.length()) {
+                // Free this segment's string immediately to release heap as we go.
+                p->segs[p->seg_idx] = String();
+                p->seg_idx++;
+                p->pos = 0;
+            }
         }
-        s->print("Telnet captures and the dashboard work right now; SSH will accept connections in a few seconds. ");
-        s->print("<span class='meta'>(this page auto-refreshes)</span>");
-        s->print("</div>");
-        return true;
-    }
-    if (!wifi_ok) {
-        s->print("<div class='card' style='border-left:4px solid #e94560'>");
-        s->print("<b>Wi-Fi not in STA mode.</b> Honeypot listeners only run while connected to a real network.");
-        s->print("</div>");
-        return true;
-    }
-    return false;
+        return written;
+    };
 }
 
 static void send_dashboard(AsyncWebServerRequest* req) {
@@ -190,142 +203,195 @@ static void send_dashboard(AsyncWebServerRequest* req) {
         if (e.protocol == "ssh") ssh_n++; else tn_n++;
         if (e.authenticated) authed_n++;
     }
-
-    AsyncResponseStream* s = req->beginResponseStream("text/html; charset=utf-8");
-    s->addHeader("Cache-Control", "no-store");
-    // Auto-refresh while still initializing so the user sees status flip live.
-    bool initializing = (g_config.get().ssh_enabled && !ssh_listener_running()) ||
-                        wifi_mode() != NetMode::OnlineSTA;
-    if (initializing) s->addHeader("Refresh", "5");
-
-    s->print(FPSTR(PAGE_HEAD));
-    s->print(FPSTR(PAGE_NAV));
-
-    render_init_banner(s);
-
-    s->print("<div class='card'><div class='kpis'>");
-    s->printf("<div class='kpi'><span>Attacks</span><b>%u</b></div>", (unsigned)total);
-    s->printf("<div class='kpi'><span>Telnet</span><b>%u</b></div>", (unsigned)tn_n);
-    s->printf("<div class='kpi'><span>SSH</span><b>%u</b></div>", (unsigned)ssh_n);
-    s->printf("<div class='kpi'><span>Logged-in</span><b>%u</b></div>", (unsigned)authed_n);
+    bool ssh_enabled = g_config.get().ssh_enabled;
+    bool ssh_running = ssh_listener_running();
+    bool wifi_ok     = wifi_mode() == NetMode::OnlineSTA;
+    bool initializing = (ssh_enabled && !ssh_running) || !wifi_ok;
     size_t total_b = storage_total_bytes();
     size_t used_b  = storage_used_bytes();
     size_t free_kb = (total_b > used_b) ? (total_b - used_b) / 1024 : 0;
-    s->printf("<div class='kpi'><span>Free flash</span><b>%u KB</b></div>", (unsigned)free_kb);
-    s->printf("<div class='kpi'><span>Free heap</span><b>%u KB</b></div>", (unsigned)(ESP.getFreeHeap() / 1024));
-    s->print("</div></div>");
 
-    s->print("<div class='card'><h3 style='margin:4px 0 12px'>Recent attacks</h3>");
+    auto pg = std::make_shared<SegPage>();
+    pg->segs.reserve(16 + v.size());
+
+    pg->segs.emplace_back(FPSTR(PAGE_HEAD));
+    pg->segs.emplace_back(FPSTR(PAGE_NAV));
+
+    // ---- init banner ----
+    if (ssh_enabled && !ssh_running) {
+        String s;
+        s.reserve(420);
+        s += F("<div class='card' style='border-left:4px solid #f0b429'><b>HoneyOpus is still initializing.</b> ");
+        s += ssh_hostkey_ready()
+            ? F("SSH host key ready, the listener is binding. ")
+            : F("Generating the SSH host key on first boot &mdash; this normally takes ~30 s on ESP32-C3. ");
+        s += F("Telnet captures and the dashboard work right now; SSH will accept connections in a few seconds. "
+               "<span class='meta'>(this page auto-refreshes)</span></div>");
+        pg->segs.push_back(std::move(s));
+    } else if (!wifi_ok) {
+        pg->segs.emplace_back(F("<div class='card' style='border-left:4px solid #e94560'>"
+                                "<b>Wi-Fi not in STA mode.</b> Honeypot listeners only run while connected to a real network.</div>"));
+    }
+
+    // ---- KPIs ----
+    {
+        char tmp[600];
+        snprintf(tmp, sizeof(tmp),
+            "<div class='card'><div class='kpis'>"
+            "<div class='kpi'><span>Attacks</span><b>%u</b></div>"
+            "<div class='kpi'><span>Telnet</span><b>%u</b></div>"
+            "<div class='kpi'><span>SSH</span><b>%u</b></div>"
+            "<div class='kpi'><span>Logged-in</span><b>%u</b></div>"
+            "<div class='kpi'><span>Free flash</span><b>%u KB</b></div>"
+            "<div class='kpi'><span>Free heap</span><b>%u KB</b></div>"
+            "</div></div>",
+            (unsigned)total, (unsigned)tn_n, (unsigned)ssh_n,
+            (unsigned)authed_n, (unsigned)free_kb,
+            (unsigned)(ESP.getFreeHeap() / 1024));
+        pg->segs.emplace_back(tmp);
+    }
+
+    // ---- recent attacks card ----
+    pg->segs.emplace_back(F("<div class='card'><h3 style='margin:4px 0 12px'>Recent attacks</h3>"));
     if (v.empty()) {
-        s->print("<p class='meta'>No attacks captured yet. Telnet listener is on port 23, SSH on port 22. "
-                 "Forward those ports from your edge router to this device's IP to start collecting.</p>");
+        pg->segs.emplace_back(F("<p class='meta'>No attacks captured yet. Telnet listener is on port 23, SSH on port 22. "
+                                "Forward those ports from your edge router to this device's IP to start collecting.</p>"));
     } else {
-        s->print("<table><thead><tr><th class='c'>#</th><th>When</th><th class='c'>Proto</th>"
-                 "<th>Source</th><th>Geo</th>"
-                 "<th class='c'>Profile</th>"
-                 "<th>Creds</th><th class='c'>Auth</th><th class='c'>Cmds</th>"
-                 "<th class='c'>Recording</th><th class='c'>Reported</th></tr></thead><tbody>");
+        pg->segs.emplace_back(F("<table><thead><tr><th class='c'>#</th><th>When</th><th class='c'>Proto</th>"
+                                "<th>Source</th><th>Geo</th><th class='c'>Profile</th>"
+                                "<th>Creds</th><th class='c'>Auth</th><th class='c'>Cmds</th>"
+                                "<th class='c'>Recording</th><th class='c'>Reported</th></tr></thead><tbody>"));
         for (auto& e : v) {
-            s->printf("<tr><td class='c'>#%u</td><td class='when'>%s</td>", (unsigned)e.id, fmt_ts(e.ts).c_str());
-            s->printf("<td class='c'><span class='badge %s'>%s</span></td>",
-                      (e.protocol == "ssh" ? "ssh" : "tn"), e.protocol.c_str());
-            s->printf("<td><code>%s</code></td>", e.ip.c_str());
-            s->print("<td>");
+            String row;
+            row.reserve(720);
+            char hdr[80];
+            snprintf(hdr, sizeof(hdr), "<tr><td class='c'>#%u</td><td class='when'>", (unsigned)e.id);
+            row += hdr;
+            row += fmt_ts(e.ts);
+            row += "</td><td class='c'><span class='badge ";
+            row += (e.protocol == "ssh" ? "ssh" : "tn");
+            row += "'>";
+            row += e.protocol;
+            row += "</span></td><td><code>";
+            row += e.ip;
+            row += "</code></td><td>";
             if (intel_ip_is_private(e.ip)) {
-                // 🏠 = U+1F3E0; title attribute provides the text alt for
-                // screen readers and hover tooltip.
-                s->print("<span class='flag' title='LAN / private network' "
-                         "aria-label='LAN'>&#x1F3E0;</span>");
+                row += F("<span class='flag' title='LAN / private network' aria-label='LAN'>&#x1F3E0;</span>");
             } else if (e.country_code.length()) {
                 String cc = e.country_code; cc.toUpperCase();
                 String alt = e.country.length() ? e.country : cc;
-                s->printf("<span class='flag' title='%s' aria-label='%s'>%s</span>",
-                          html_escape(alt).c_str(), html_escape(cc).c_str(),
-                          flag_emoji(e.country_code).c_str());
-                s->print(html_escape(e.country));
+                row += "<span class='flag' title='";
+                row += html_escape(alt);
+                row += "' aria-label='";
+                row += html_escape(cc);
+                row += "'>";
+                row += flag_emoji(e.country_code);
+                row += "</span>";
+                row += html_escape(e.country);
             } else {
-                s->print(html_escape(e.country));
+                row += html_escape(e.country);
             }
             if (!intel_ip_is_private(e.ip)) {
-                if (e.city.length())  { s->print(" · "); s->print(html_escape(e.city)); }
-                if (e.isp.length())   { s->printf("<div class='meta'>%s</div>", html_escape(e.isp).c_str()); }
+                if (e.city.length()) { row += " · "; row += html_escape(e.city); }
+                if (e.isp.length())  { row += "<div class='meta'>"; row += html_escape(e.isp); row += "</div>"; }
             }
-            s->print("</td>");
-            // Profile / behavioural fingerprint — icon only; alt/title carry the label.
-            {
-                auto pv = profile_visual(e.profile);
-                s->printf("<td class='c'><span class='flag' title='%s' aria-label='%s'>%s</span></td>",
-                          pv.alt, pv.alt, pv.icon);
-            }
-            s->printf("<td><code>%s</code> / <code>%s</code></td>",
-                      html_escape(e.user).c_str(), html_escape(e.pass).c_str());
-            s->print(e.authenticated ? "<td class='c'><span class='badge ok'>yes</span></td>"
-                                     : "<td class='c'><span class='badge no'>no</span></td>");
-            s->printf("<td class='c'>%u</td>", (unsigned)e.commands);
-            s->print("<td class='c'>");
+            row += "</td>";
+            auto pv = profile_visual(e.profile);
+            row += "<td class='c'><span class='flag' title='";
+            row += pv.alt;
+            row += "' aria-label='";
+            row += pv.alt;
+            row += "'>";
+            row += pv.icon;
+            row += "</span></td><td><code>";
+            row += html_escape(e.user);
+            row += "</code> / <code>";
+            row += html_escape(e.pass);
+            row += "</code></td>";
+            row += e.authenticated
+                ? F("<td class='c'><span class='badge ok'>yes</span></td>")
+                : F("<td class='c'><span class='badge no'>no</span></td>");
+            char cmds[48];
+            snprintf(cmds, sizeof(cmds), "<td class='c'>%u</td>", (unsigned)e.commands);
+            row += cmds;
+            row += "<td class='c'>";
             if (e.cast_path.length()) {
-                s->printf("<a class='iconlink' href='/play?id=%u' "
-                          "title='Play recording in browser' aria-label='Play recording'>&#x25B6;&#xFE0F;</a> "
-                          "<a class='iconlink' href='/cast?id=%u' download "
-                          "title='Download asciinema .cast file' aria-label='Download .cast'>&#x2B07;&#xFE0F;</a>",
-                          (unsigned)e.id, (unsigned)e.id);
-            } else s->print("—");
-            s->print("</td><td class='c'>");
-            // Greyed out via .repicon.off when no report was sent.
-            s->printf("<span class='repicon%s' title='AbuseIPDB %s' "
-                      "aria-label='AbuseIPDB %s'>&#x1F6E1;&#xFE0F;</span>",
-                      e.reported_abuseipdb ? "" : " off",
-                      e.reported_abuseipdb ? "reported" : "not reported",
-                      e.reported_abuseipdb ? "reported" : "not reported");
-            s->printf("<span class='repicon%s' title='AlienVault OTX %s' "
-                      "aria-label='OTX %s'>&#x1F989;</span>",
-                      e.reported_otx ? "" : " off",
-                      e.reported_otx ? "reported" : "not reported",
-                      e.reported_otx ? "reported" : "not reported");
-            s->print("</td></tr>");
+                char rec[320];
+                snprintf(rec, sizeof(rec),
+                    "<a class='iconlink' href='/play?id=%u' title='Play recording in browser' aria-label='Play recording'>&#x25B6;&#xFE0F;</a> "
+                    "<a class='iconlink' href='/cast?id=%u' download title='Download asciinema .cast file' aria-label='Download .cast'>&#x2B07;&#xFE0F;</a>",
+                    (unsigned)e.id, (unsigned)e.id);
+                row += rec;
+            } else row += "—";
+            row += "</td><td class='c'>";
+            row += e.reported_abuseipdb
+                ? F("<span class='repicon' title='AbuseIPDB reported' aria-label='AbuseIPDB reported'>&#x1F6E1;&#xFE0F;</span>")
+                : F("<span class='repicon off' title='AbuseIPDB not reported' aria-label='AbuseIPDB not reported'>&#x1F6E1;&#xFE0F;</span>");
+            row += e.reported_otx
+                ? F("<span class='repicon' title='AlienVault OTX reported' aria-label='OTX reported'>&#x1F989;</span>")
+                : F("<span class='repicon off' title='AlienVault OTX not reported' aria-label='OTX not reported'>&#x1F989;</span>");
+            row += "</td></tr>";
+            pg->segs.push_back(std::move(row));
         }
-        s->print("</tbody></table>");
+        pg->segs.emplace_back(F("</tbody></table>"));
     }
-    s->print("</div>");
+    pg->segs.emplace_back(F("</div>"));
 
-    s->printf("<p class='meta'>HoneyOpus on ESP32-C3 · IP %s · uptime %us · "
-              "Telnet %s · SSH %s</p>",
-              wifi_ip_string().c_str(),
-              (unsigned)(millis() / 1000),
-              g_config.get().telnet_enabled ? "on" : "off",
-              !g_config.get().ssh_enabled ? "off"
-                  : (ssh_listener_running() ? "on" : "starting"));
-    s->print(FPSTR(PAGE_FOOT));
+    {
+        char foot[256];
+        snprintf(foot, sizeof(foot),
+            "<p class='meta'>HoneyOpus on ESP32-C3 · IP %s · uptime %us · Telnet %s · SSH %s</p>",
+            wifi_ip_string().c_str(),
+            (unsigned)(millis() / 1000),
+            g_config.get().telnet_enabled ? "on" : "off",
+            !ssh_enabled ? "off" : (ssh_running ? "on" : "starting"));
+        pg->segs.emplace_back(foot);
+    }
+    pg->segs.emplace_back(FPSTR(PAGE_FOOT));
 
-    req->send(s);
+    AsyncWebServerResponse* resp = req->beginChunkedResponse("text/html; charset=utf-8",
+                                                             make_seg_filler(pg));
+    resp->addHeader("Cache-Control", "no-store");
+    if (initializing) resp->addHeader("Refresh", "5");
+    req->send(resp);
 }
 
 static void send_config_page(AsyncWebServerRequest* req) {
     if (!authed(req)) return req->requestAuthentication();
     auto& c = g_config.get();
-    AsyncResponseStream* s = req->beginResponseStream("text/html; charset=utf-8");
-    s->print(FPSTR(PAGE_HEAD));
-    s->print(FPSTR(PAGE_NAV));
-    s->print("<div class='card'><h3>Configuration</h3>"
-             "<form method='POST' action='/config'>");
+    auto pg = std::make_shared<SegPage>();
+    pg->segs.reserve(80);
+    auto add = [&](const String& s) { pg->segs.push_back(s); };
+    auto addF = [&](const __FlashStringHelper* f) { pg->segs.emplace_back(f); };
+
+    addF(FPSTR(PAGE_HEAD));
+    addF(FPSTR(PAGE_NAV));
+    addF(F("<div class='card'><h3>Configuration</h3>"
+           "<form method='POST' action='/config'>"));
+
     auto field = [&](const char* label, const char* name, const String& val, const char* type = "text") {
-        s->printf("<div class='row'><label>%s</label>"
-                  "<input type='%s' name='%s' value='%s'/></div>",
-                  label, type, name, html_escape(val).c_str());
+        String s; s.reserve(160 + val.length());
+        s += "<div class='row'><label>"; s += label; s += "</label><input type='";
+        s += type; s += "' name='"; s += name; s += "' value='";
+        s += html_escape(val); s += "'/></div>";
+        add(s);
     };
     auto checkbox = [&](const char* label, const char* name, bool val) {
-        s->printf("<div class='row'><label>%s</label>"
-                  "<label class='switch'>"
-                  "<input type='hidden' name='%s' value='0'/>"
-                  "<input type='checkbox' name='%s' value='1'%s/>"
-                  "<span class='slider'></span></label></div>",
-                  label, name, name, val ? " checked" : "");
+        String s; s.reserve(220);
+        s += "<div class='row'><label>"; s += label; s += "</label>"
+             "<label class='switch'><input type='hidden' name='"; s += name;
+        s += "' value='0'/><input type='checkbox' name='"; s += name;
+        s += "' value='1'"; if (val) s += " checked";
+        s += "/><span class='slider'></span></label></div>";
+        add(s);
     };
     auto sec_open  = [&](const char* title, bool open = true) {
-        s->printf("<details class='section'%s><summary>%s</summary><div class='body'>",
-                  open ? " open" : "", title);
+        String s; s.reserve(80 + strlen(title));
+        s += "<details class='section'"; if (open) s += " open";
+        s += "><summary>"; s += title; s += "</summary><div class='body'>";
+        add(s);
     };
-    auto sec_close = [&]() { s->print("</div></details>"); };
+    auto sec_close = [&]() { addF(F("</div></details>")); };
 
     sec_open("\xF0\x9F\x93\xB6 Wi-Fi");
     field("WiFi SSID", "wifi_ssid", c.wifi_ssid);
@@ -347,8 +413,8 @@ static void send_config_page(AsyncWebServerRequest* req) {
     sec_open("\xF0\x9F\x94\x90 Dashboard auth", false);
     field("User", "dashboard_user", c.dashboard_user);
     field("Password", "dashboard_pass", c.dashboard_pass, "password");
-    s->print("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
-             "Authentication is automatically bypassed for clients on the local network.</p>");
+    addF(F("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
+           "Authentication is automatically bypassed for clients on the local network.</p>"));
     sec_close();
 
     sec_open("\xF0\x9F\x8C\x8D Geolocation", false);
@@ -363,8 +429,8 @@ static void send_config_page(AsyncWebServerRequest* req) {
     checkbox("AlienVault OTX", "otx_enabled", c.otx_enabled);
     field("OTX API key", "otx_key", c.otx_key, "password");
     field("OTX pulse name", "otx_pulse_name", c.otx_pulse_name);
-    s->print("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
-             "Attacks coming from LAN/private IPs are never reported.</p>");
+    addF(F("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
+           "Attacks coming from LAN/private IPs are never reported.</p>"));
     sec_close();
 
     sec_open("\xE2\x8F\xB0 Time &amp; NTP", false);
@@ -372,10 +438,10 @@ static void send_config_page(AsyncWebServerRequest* req) {
     field("NTP server #1", "ntp_server1", c.ntp_server1);
     field("NTP server #2", "ntp_server2", c.ntp_server2);
     field("NTP server #3", "ntp_server3", c.ntp_server3);
-    s->print("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
-             "Examples: <code>CET-1CEST,M3.5.0,M10.5.0/3</code> (Europe), "
-             "<code>EST5EDT,M3.2.0,M11.1.0</code> (US East), "
-             "<code>UTC0</code>. Re-applied immediately on save.</p>");
+    addF(F("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
+           "Examples: <code>CET-1CEST,M3.5.0,M10.5.0/3</code> (Europe), "
+           "<code>EST5EDT,M3.2.0,M11.1.0</code> (US East), "
+           "<code>UTC0</code>. Re-applied immediately on save.</p>"));
     sec_close();
 
     sec_open("\xF0\x9F\x96\xA5\xEF\xB8\x8F Display", false);
@@ -394,23 +460,19 @@ static void send_config_page(AsyncWebServerRequest* req) {
           String((unsigned)c.max_session_dir_kb), "number");
     sec_close();
 
-    s->print("<div class='row'><label></label><div>"
-             "<button type='submit'>Save</button> "
-             "<button type='button' class='alt' onclick=\"location.href='/'\">Cancel</button>"
-             "</div></div></form>");
+    addF(F("<div class='row'><label></label><div>"
+           "<button type='submit'>Save</button> "
+           "<button type='button' class='alt' onclick=\"location.href='/'\">Cancel</button>"
+           "</div></div></form>"
+           "<h4 style='color:#e94560;margin-top:24px'>Danger zone</h4>"
+           "<p class='meta' style='margin:-6px 0 10px'>"
+           "Permanently deletes all recorded sessions and attack-log entries. "
+           "Configuration (WiFi, API keys, …) is preserved.</p>"
+           "<button type='button' class='danger' onclick=\"showClear()\">"
+           "&#x1F5D1;&#xFE0F; Clear all attack history</button>"
+           "</div>"));
 
-    // ---- Danger zone ----
-    s->print("<h4 style='color:#e94560;margin-top:24px'>Danger zone</h4>"
-             "<p class='meta' style='margin:-6px 0 10px'>"
-             "Permanently deletes all recorded sessions and attack-log entries. "
-             "Configuration (WiFi, API keys, …) is preserved.</p>"
-             "<button type='button' class='danger' onclick=\"showClear()\">"
-             "&#x1F5D1;&#xFE0F; Clear all attack history</button>");
-
-    s->print("</div>");  // close .card
-
-    // ---- Confirmation modal ----
-    s->print(R"HTML(
+    addF(F(R"HTML(
 <div class="modal-bg" id="clearModal">
   <div class="modal" role="dialog" aria-labelledby="clrTitle" aria-modal="true">
     <h3 id="clrTitle">&#x26A0;&#xFE0F; Clear all attack history?</h3>
@@ -443,9 +505,13 @@ function doClear(){
       alert('Clear failed: '+err);});
 }
 </script>
-)HTML");
-    s->print(FPSTR(PAGE_FOOT));
-    req->send(s);
+)HTML"));
+    addF(FPSTR(PAGE_FOOT));
+
+    AsyncWebServerResponse* resp = req->beginChunkedResponse("text/html; charset=utf-8",
+                                                             make_seg_filler(pg));
+    resp->addHeader("Cache-Control", "no-store");
+    req->send(resp);
 }
 
 static void handle_config_post(AsyncWebServerRequest* req) {
