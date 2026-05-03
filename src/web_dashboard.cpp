@@ -370,6 +370,9 @@ static void send_dashboard(AsyncWebServerRequest* req) {
             row += e.reported_otx
                 ? F("<span class='repicon' title='AlienVault OTX reported' aria-label='OTX reported'>&#x1F989;</span>")
                 : F("<span class='repicon off' title='AlienVault OTX not reported' aria-label='AlienVault OTX not reported'>&#x1F989;</span>");
+            row += e.reported_hub
+                ? F("<span class='repicon' title='HoneyOpus Hub reported' aria-label='Hub reported'>&#x1F36F;</span>")
+                : F("<span class='repicon off' title='HoneyOpus Hub not reported' aria-label='Hub not reported'>&#x1F36F;</span>");
             row += "</td></tr>";
             pg->segs.push_back(std::move(row));
             return true;
@@ -474,8 +477,13 @@ static void send_config_page(AsyncWebServerRequest* req) {
     field("OTX API key", "otx_key", c.otx_key, "password");
     field("OTX pulse name", "otx_pulse_name", c.otx_pulse_name);
     field("OTX pulse id (fixed; empty = create-by-name)", "otx_pulse_id", c.otx_pulse_id);
+    checkbox("HoneyOpus Hub", "hub_enabled", c.hub_enabled);
+    field("Hub URL (origin only, no path)", "hub_url", c.hub_url);
+    field("Hub token (hop_…)", "hub_token", c.hub_token, "password");
     addF(F("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
-           "Attacks coming from LAN/private IPs are never reported.</p>"));
+           "Attacks coming from LAN/private IPs are never reported to AbuseIPDB or OTX. "
+           "The Hub <b>does</b> receive LAN attacks (idempotent on attack id). "
+           "See <code>docs/INGEST_PROTOCOL.md</code> in the HoneyOpusHUB repo.</p>"));
     sec_close();
 
     sec_open("\xE2\x8F\xB0 Time &amp; NTP", false);
@@ -609,6 +617,11 @@ static void handle_config_post(AsyncWebServerRequest* req) {
     c.otx_key        = get("otx_key", c.otx_key);
     c.otx_pulse_name = get("otx_pulse_name", c.otx_pulse_name);
     c.otx_pulse_id   = get("otx_pulse_id", c.otx_pulse_id);
+    c.hub_enabled    = getBool("hub_enabled", c.hub_enabled);
+    c.hub_url        = get("hub_url", c.hub_url);
+    c.hub_token      = get("hub_token", c.hub_token);
+    while (c.hub_url.length() && c.hub_url[c.hub_url.length() - 1] == '/')
+        c.hub_url.remove(c.hub_url.length() - 1);
     String old_tz   = c.tz;
     String old_ntp1 = c.ntp_server1;
     String old_ntp2 = c.ntp_server2;

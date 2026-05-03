@@ -10,6 +10,10 @@ bool intel_report_abuseipdb(AttackEntry& e);
 // Submits e to AlienVault OTX as a tiny one-IP pulse. Sets e.reported_otx.
 bool intel_report_otx(AttackEntry& e);
 
+// Submits e to the configured HoneyOpus Hub (docs/INGEST_PROTOCOL.md).
+// Sets e.reported_hub on 2xx (or on permanent 4xx so we don't retry forever).
+bool intel_report_hub(AttackEntry& e);
+
 // Convenience that runs both reporters according to config.
 void intel_report_all(AttackEntry& e);
 

@@ -50,6 +50,15 @@ struct Config {
     // pulse-by-name behavior.
     String otx_pulse_id      = "69f726101fd2d1e4eba3a886";
 
+    // HoneyOpus Hub reporter — the project's own ingest endpoint, in
+    // addition to AbuseIPDB / OTX. Spec: docs/INGEST_PROTOCOL.md
+    // (KaSt/HoneyOpusHUB). The hub aggregates this device's attacks
+    // alongside the user's other honeypots and renders them on a
+    // dashboard. Token format is `hop_` + 32 base64url chars; see §2.
+    bool   hub_enabled    = false;
+    String hub_url        = "";        // origin only, e.g. "https://my-hub.example"
+    String hub_token      = "";        // bearer token issued by the hub
+
     // Time / timezone — POSIX TZ string. Default is Central European Time with
     // EU DST rules (last Sunday of March → last Sunday of October at 03:00).
     String tz           = "CET-1CEST,M3.5.0,M10.5.0/3";

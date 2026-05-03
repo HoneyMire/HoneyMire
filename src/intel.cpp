@@ -6,6 +6,7 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -392,9 +393,207 @@ bool intel_report_otx(AttackEntry& e) {
     return false;
 }
 
+// =====================================================================
+// HoneyOpus Hub reporter (docs/INGEST_PROTOCOL.md, schema "honeyopus.attack/v1")
+// =====================================================================
+
+// Per-board cast cap. Hub spec hard-limits the cast_v2 field to 200 KiB
+// after JSON encoding; we cap before encoding to leave headroom and to
+// avoid pushing C3 heap over the cliff. Override per env in platformio.ini.
+#ifndef HONEYOPUS_HUB_CAST_MAX_KB
+#define HONEYOPUS_HUB_CAST_MAX_KB 100
+#endif
+static const size_t kHubCastMaxBytes = (size_t)HONEYOPUS_HUB_CAST_MAX_KB * 1024;
+
+// Hub does not need TLS handshake quite as much heap as the ones above
+// because the body is large but the request is single-shot; still we use
+// the same conservative gate.
+static String hub_device_id_() {
+    uint64_t mac = ESP.getEfuseMac();
+    // Use the lower 6 bytes (the MAC). Format lowercase hex, no colons.
+    char buf[24];
+    snprintf(buf, sizeof(buf), "hp-%02x%02x%02x%02x%02x%02x",
+             (unsigned)((mac >> 40) & 0xff), (unsigned)((mac >> 32) & 0xff),
+             (unsigned)((mac >> 24) & 0xff), (unsigned)((mac >> 16) & 0xff),
+             (unsigned)((mac >>  8) & 0xff), (unsigned)( mac        & 0xff));
+    return String(buf);
+}
+
+static void hub_fill_hardware_(JsonObject hw) {
+    hw["mcu"]      = HONEYOPUS_HW_MCU;
+    hw["board"]    = HONEYOPUS_HW_BOARD;
+    hw["display"]  = HONEYOPUS_HW_DISPLAY;
+    hw["flash_mb"] = (uint32_t)((ESP.getFlashChipSize() + 1024 * 1024 - 1) / (1024 * 1024));
+    hw["psram_kb"] = (uint32_t)(ESP.getPsramSize() / 1024);
+    hw["cpu_mhz"]  = (uint32_t)getCpuFrequencyMhz();
+}
+
+// Read at most kHubCastMaxBytes from the cast file. If we have to truncate,
+// walk back to the last newline so the consumer sees only complete events.
+static bool hub_load_cast_(const String& path, String& out, bool& truncated) {
+    out = "";
+    truncated = false;
+    if (!path.length()) return false;
+    File f = LittleFS.open(path, "r");
+    if (!f) return false;
+    size_t total = f.size();
+    size_t take  = total > kHubCastMaxBytes ? kHubCastMaxBytes : total;
+    out.reserve(take + 1);
+    uint8_t buf[512];
+    size_t left = take;
+    while (left) {
+        size_t n = f.read(buf, left > sizeof(buf) ? sizeof(buf) : left);
+        if (!n) break;
+        out.concat((const char*)buf, n);
+        left -= n;
+    }
+    f.close();
+    if (take < total) {
+        // Walk back to last \n so we don't ship a half-event.
+        int nl = out.lastIndexOf('\n');
+        if (nl > 0) out.remove((unsigned)nl + 1);
+        truncated = true;
+    }
+    return out.length() > 0;
+}
+
+bool intel_report_hub(AttackEntry& e) {
+    auto& cfg = g_config.get();
+    if (!cfg.hub_enabled) return false;
+    if (cfg.hub_url.length() == 0 || cfg.hub_token.length() == 0) return false;
+    if (e.reported_hub) return true;
+    // Per spec §12.6: hub does NOT suppress LAN attacks.
+
+    if (!heap_ok_for_tls_("hub")) return false;
+
+    // Build payload --------------------------------------------------------
+    JsonDocument doc;
+    doc["schema"] = "honeyopus.attack/v1";
+
+    JsonObject hp = doc["honeypot"].to<JsonObject>();
+    hp["device_id"]        = hub_device_id_();
+    hp["firmware_version"] = HONEYOPUS_VERSION;
+    hp["firmware_build"]   = __DATE__ " " __TIME__;
+    hp["uptime_s"]         = (uint32_t)(millis() / 1000);
+    hub_fill_hardware_(hp["hardware"].to<JsonObject>());
+
+    JsonObject at = doc["attack"].to<JsonObject>();
+    at["id"]            = e.id;
+    at["ts"]            = (uint32_t)e.ts;
+    at["protocol"]      = e.protocol;
+    at["src_ip"]        = e.ip;
+    at["src_port"]      = e.port;
+    at["dst_port"]      = (e.protocol == "ssh") ? HONEYOPUS_SSH_PORT : HONEYOPUS_TELNET_PORT;
+    at["user"]          = e.user;
+    at["pass"]          = e.pass;
+    at["authenticated"] = e.authenticated;
+    at["commands"]      = e.commands;
+    at["duration_ms"]   = e.duration_ms;
+    at["lan"]           = intel_ip_is_private(e.ip);
+
+    if (e.pubkeys.length()) {
+        JsonArray pk = at["pubkeys"].to<JsonArray>();
+        int start = 0;
+        while (start < (int)e.pubkeys.length()) {
+            int nl = e.pubkeys.indexOf('\n', start);
+            String line = (nl < 0) ? e.pubkeys.substring(start)
+                                   : e.pubkeys.substring(start, nl);
+            line.trim();
+            if (line.length()) pk.add(line);
+            if (nl < 0) break;
+            start = nl + 1;
+        }
+    }
+
+    if (e.profile.length()) {
+        JsonObject cls = at["classification"].to<JsonObject>();
+        cls["profile"]    = e.profile;
+        cls["confidence"] = e.profile_confidence;
+    }
+
+    if (e.geo_resolved && e.country.length()) {
+        JsonObject g = at["geo"].to<JsonObject>();
+        if (e.country.length())      g["country"]      = e.country;
+        if (e.country_code.length()) g["country_code"] = e.country_code;
+        if (e.city.length())         g["city"]         = e.city;
+        if (e.region.length())       g["region"]       = e.region;
+        if (e.isp.length())          g["isp"]          = e.isp;
+        if (e.asn.length())          g["asn"]          = e.asn;
+        if (e.lat != 0.0f)           g["lat"]          = e.lat;
+        if (e.lon != 0.0f)           g["lon"]          = e.lon;
+    }
+
+    JsonArray rt = at["reported_to"].to<JsonArray>();
+    if (e.reported_abuseipdb) rt.add("abuseipdb");
+    if (e.reported_otx)       rt.add("otx");
+
+    if (e.cast_path.length()) {
+        String cast;
+        bool truncated = false;
+        if (hub_load_cast_(e.cast_path, cast, truncated)) {
+            at["cast_v2"]        = cast;
+            at["cast_truncated"] = truncated;
+        }
+    }
+
+    String body;
+    serializeJson(doc, body);
+    doc.clear();
+
+    // POST -----------------------------------------------------------------
+    String url = cfg.hub_url;
+    while (url.length() && url[url.length() - 1] == '/') url.remove(url.length() - 1);
+    url += "/api/v1/ingest";
+
+    bool tls = url.startsWith("https://");
+    HTTPClient http;
+    int code = -1;
+    String resp;
+    if (tls) {
+        WiFiClientSecure cs;
+        cs.setInsecure();
+        if (!http.begin(cs, url)) return false;
+        http.addHeader("Authorization", String("Bearer ") + cfg.hub_token);
+        http.addHeader("Content-Type", "application/json; charset=utf-8");
+        http.setTimeout(15000);
+        code = http.POST(body);
+        resp = http.getString();
+        http.end();
+    } else {
+        WiFiClient c;
+        if (!http.begin(c, url)) return false;
+        http.addHeader("Authorization", String("Bearer ") + cfg.hub_token);
+        http.addHeader("Content-Type", "application/json; charset=utf-8");
+        http.setTimeout(15000);
+        code = http.POST(body);
+        resp = http.getString();
+        http.end();
+    }
+
+    if (code >= 200 && code < 300) {
+        e.reported_hub = true;
+        Serial.printf("[hub] %s id=%u reported, http=%d (%u B)\n",
+                      e.ip.c_str(), (unsigned)e.id, code, (unsigned)body.length());
+        return true;
+    }
+    // Spec §4: 4xx (other than 429) are permanent — don't retry. Mark as
+    // "reported" so we don't keep re-uploading rejected payloads forever.
+    if (code >= 400 && code < 500 && code != 429) {
+        e.reported_hub = true;
+        Serial.printf("[hub] %s id=%u rejected http=%d resp=%s (dropped)\n",
+                      e.ip.c_str(), (unsigned)e.id, code, resp.c_str());
+        return false;
+    }
+    Serial.printf("[hub] %s id=%u failed http=%d resp=%s\n",
+                  e.ip.c_str(), (unsigned)e.id, code, resp.c_str());
+    return false;
+}
+
 void intel_report_all(AttackEntry& e) {
     intel_report_abuseipdb(e);
     intel_report_otx(e);
+    // Hub LAST so reported_to[] reflects the upstream reporters.
+    intel_report_hub(e);
 }
 
 static void intelTask_(void*) {

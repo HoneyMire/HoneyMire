@@ -72,6 +72,9 @@ bool ConfigStore::load() {
     cfg_.otx_key         = prefs_.getString("otx_k", cfg_.otx_key);
     cfg_.otx_pulse_name  = prefs_.getString("otx_p", cfg_.otx_pulse_name);
     cfg_.otx_pulse_id    = prefs_.getString("otx_pid", cfg_.otx_pulse_id);
+    cfg_.hub_enabled     = prefs_.getBool("hub_en",  cfg_.hub_enabled);
+    cfg_.hub_url         = prefs_.getString("hub_url", cfg_.hub_url);
+    cfg_.hub_token       = prefs_.getString("hub_tok", cfg_.hub_token);
     cfg_.tz              = prefs_.getString("tz",     cfg_.tz);
     cfg_.ntp_server1     = prefs_.getString("ntp1",   cfg_.ntp_server1);
     cfg_.ntp_server2     = prefs_.getString("ntp2",   cfg_.ntp_server2);
@@ -107,6 +110,9 @@ bool ConfigStore::save() {
     prefs_.putString("otx_k", cfg_.otx_key);
     prefs_.putString("otx_p", cfg_.otx_pulse_name);
     prefs_.putString("otx_pid", cfg_.otx_pulse_id);
+    prefs_.putBool("hub_en",  cfg_.hub_enabled);
+    prefs_.putString("hub_url", cfg_.hub_url);
+    prefs_.putString("hub_tok", cfg_.hub_token);
     prefs_.putString("tz",     cfg_.tz);
     prefs_.putString("ntp1",   cfg_.ntp_server1);
     prefs_.putString("ntp2",   cfg_.ntp_server2);

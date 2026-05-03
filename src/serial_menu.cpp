@@ -38,6 +38,8 @@ static void show_menu_() {
     Serial.println("  t) Toggle Telnet enabled");
     Serial.println("  k) Set AbuseIPDB API key");
     Serial.println("  o) Set AlienVault OTX API key");
+    Serial.println("  u) Set HoneyOpus Hub URL");
+    Serial.println("  b) Set HoneyOpus Hub token");
     Serial.println("  q) Quit menu");
     Serial.print("> ");
 }
@@ -60,6 +62,10 @@ static void show_config_() {
     Serial.printf("  otx             : %s (%s)\n",
                   c.otx_enabled ? "ENABLED" : "disabled",
                   c.otx_key.length() ? "key set" : "no key");
+    Serial.printf("  hub             : %s url=%s (%s)\n",
+                  c.hub_enabled ? "ENABLED" : "disabled",
+                  c.hub_url.length() ? c.hub_url.c_str() : "(unset)",
+                  c.hub_token.length() ? "token set" : "no token");
     Serial.printf("  dashboard       : http://%s/  user=%s\n",
                   WiFi.localIP() == IPAddress() ? WiFi.softAPIP().toString().c_str()
                                                 : WiFi.localIP().toString().c_str(),
@@ -102,6 +108,14 @@ static void apply_pending_(const String& val) {
     } else if (s_pending_field == "otx_key") {
         c.otx_key = val;
         c.otx_enabled = val.length() > 0;
+    } else if (s_pending_field == "hub_url") {
+        String u = val;
+        while (u.length() && u[u.length() - 1] == '/') u.remove(u.length() - 1);
+        c.hub_url = u;
+        c.hub_enabled = c.hub_url.length() > 0 && c.hub_token.length() > 0;
+    } else if (s_pending_field == "hub_token") {
+        c.hub_token = val;
+        c.hub_enabled = c.hub_url.length() > 0 && c.hub_token.length() > 0;
     }
     g_config.save();
     Serial.printf("  saved %s.\n", s_pending_field.c_str());
@@ -149,6 +163,8 @@ static void handle_menu_char_(char c) {
         }
         case 'k': prompt_for_("abuseipdb_key"); return;
         case 'o': prompt_for_("otx_key");       return;
+        case 'u': prompt_for_("hub_url");       return;
+        case 'b': prompt_for_("hub_token");     return;
         case 'q':
             Serial.println("  quitting menu.");
             s_state = State::Idle;

@@ -61,6 +61,7 @@ void AttackEntry::toJson(JsonObject o) const {
     o["geo_resolved"]  = geo_resolved;
     o["reported_abuseipdb"] = reported_abuseipdb;
     o["reported_otx"]  = reported_otx;
+    o["reported_hub"]  = reported_hub;
 }
 
 AttackEntry AttackEntry::fromJson(JsonObjectConst o) {
@@ -90,6 +91,7 @@ AttackEntry AttackEntry::fromJson(JsonObjectConst o) {
     e.geo_resolved  = o["geo_resolved"]  | false;
     e.reported_abuseipdb = o["reported_abuseipdb"] | false;
     e.reported_otx       = o["reported_otx"]       | false;
+    e.reported_hub       = o["reported_hub"]       | false;
     return e;
 }
 

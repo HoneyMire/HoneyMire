@@ -5,7 +5,8 @@ the built-in 0.42" OLED, LilyGO T-QT Pro with a 128×128 colour IPS, or a
 headless S3-N16R8 module). Records every captured session as an
 [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/), classifies the
 attacker (Mirai bot, IoT loader, manual operator, …), geolocates them, and
-optionally submits the IP to **AbuseIPDB** and **AlienVault OTX** in the
+optionally submits the IP to **AbuseIPDB**, **AlienVault OTX** and a
+self-hosted **HoneyOpus Hub** in the
 background. A web dashboard, captive-portal Wi-Fi setup, and serial CLI are
 bundled in.
 
@@ -85,6 +86,8 @@ HoneyOpus :: menu
   t) Toggle Telnet enabled
   k) Set AbuseIPDB API key
   o) Set AlienVault OTX API key
+  u) Set HoneyOpus Hub URL
+  b) Set HoneyOpus Hub token
 ```
 
 ## OLED behaviour
@@ -138,9 +141,21 @@ never blocked. Each captured attack triggers:
    pulse id is pinned in *Config* (field *OTX pulse id*) so the same feed
    keeps growing across reboots. Leave it empty to fall back to
    create-by-name behaviour.
+4. **HoneyOpus Hub** — the project's own ingest endpoint for users running
+   their own dashboard. Each attack is POSTed once (idempotent on
+   `(token, attack.id)`) to `<hub_url>/api/v1/ingest` as a single JSON
+   document containing the full session metadata, geo, classification,
+   pubkeys and the asciicast itself (capped per board: 50 KiB on C3,
+   100 KiB on T-QT Pro, 200 KiB on N16R8). Configure *Hub URL* and
+   *Hub token* in *Config*. Unlike AbuseIPDB/OTX, the Hub **does**
+   receive LAN attacks (so you can validate your setup). Token format
+   is `hop_` + 32 base64url chars; see
+   [`docs/INGEST_PROTOCOL.md`](https://github.com/KaSt/HoneyOpusHUB/blob/main/docs/INGEST_PROTOCOL.md)
+   in the HoneyOpusHUB repo for the wire contract.
 
-Both are off by default. Enable them in *Config* and paste your API keys.
-**Attacks coming from LAN/private IPs are never reported** to either service.
+The first three are off by default. Enable them in *Config* and paste your
+API keys. **Attacks coming from LAN/private IPs are never reported** to
+AbuseIPDB or OTX (the Hub is exempt from this rule).
 
 ## Asciinema sessions
 
@@ -218,7 +233,7 @@ src/
   telnet_honeypot.{h,cpp}
   ssh_honeypot.{h,cpp}    libssh-esp32 server
   geoip.{h,cpp}
-  intel.{h,cpp}           AbuseIPDB + OTX reporters (background task)
+  intel.{h,cpp}           AbuseIPDB + OTX + HoneyOpus Hub reporters (background task)
   wifi_manager.{h,cpp}    STA + SoftAP fallback + DNS hijack
   serial_menu.{h,cpp}
   web_dashboard.{h,cpp}   AsyncWebServer + captive portal + web installer page
