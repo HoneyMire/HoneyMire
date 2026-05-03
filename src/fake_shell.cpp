@@ -882,6 +882,23 @@ String FakeShell::runOne_(Cmd& c) {
     if (e==":"||e=="true") return "";
     if (e=="false") { last_status_ok_=false; return ""; }
 
+    // ----- Mirai/Gafgyt login probes & shell-cleanup commands -----
+    // After successful telnet auth, Mirai sends:
+    //   enable\nshell\nsh\n/bin/busybox MIRAI
+    // The first three need to silently succeed (real BusyBox responds to
+    // each by spawning a sub-shell that just exits). If we return
+    // "command not found", the bot flags us as a honeypot and disconnects.
+    if (e=="enable" || e=="shell" || e=="system" || e=="linuxshell") return "";
+    // Bots clean up traces with these — silent success is correct.
+    if (e=="unset" || e=="alias" || e=="unalias") return "";
+    if (e=="ulimit" || e=="umask") return "";
+    // dd is used both for system probing (`dd if=/dev/zero ...`) and as
+    // a stager (`dd bs=52 count=1 if=.s of=/tmp/x`). Silent success +
+    // optional file creation is enough for the bot's flow to continue.
+    if (e=="dd") return cmdDd_(c);
+    // Fake top one-shot — bots use `top -bn1` for recon.
+    if (e=="top") return cmdTop_(c);
+
     // not found
     last_status_ok_ = false;
     return "-bash: " + c.argv[0] + ": command not found\n";
@@ -1258,6 +1275,18 @@ String FakeShell::cmdCat_(Cmd& c) {
         if (abs=="/etc/hostname")   { out += host_; out += "\n"; continue; }
         if (abs=="/etc/hosts")      { out += FAKE_HOSTS; continue; }
         if (abs=="/etc/resolv.conf"){ out += FAKE_RESOLV; continue; }
+        if (abs=="/etc/machine-id") { out += "f3b1d4c2a5e74e8b9c1f0a2d3e4f5a6b\n"; continue; }
+        if (abs=="/proc/net/route") {
+            out += "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
+            out += "eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n";
+            out += "eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+            continue;
+        }
+        if (abs=="/proc/net/tcp") {
+            out += "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+            out += "   0: 0100007F:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 11842 1 0000000000000000 100 0 0 10 0\n";
+            continue;
+        }
         // /proc/* files (top-level + per-pid). procVirtualFile_ knows the
         // current cat invocation so /proc/self/cmdline reflects argv.
         {
@@ -1798,6 +1827,67 @@ String FakeShell::cmdFtpget_(Cmd& c) {
     String body; serializeJson(d, body);
     logEvent_("download_url", body);
     return "";
+}
+
+// ----- dd / top (bot recon + binary stager) -----
+
+String FakeShell::cmdDd_(Cmd& c) {
+    // Mirai uses dd both as a recon tool ('dd if=/dev/zero bs=...') and as
+    // a binary stager ('dd if=stage of=/tmp/x bs=52 count=1'). Parse just
+    // the if=/of=/bs=/count= keys; create the of= file if any.
+    String inp, outp; uint32_t bs = 512, cnt = 0;
+    for (size_t i = 1; i < c.argv.size(); ++i) {
+        const String& a = c.argv[i];
+        if (a.startsWith("if="))    inp = a.substring(3);
+        else if (a.startsWith("of=")) outp = a.substring(3);
+        else if (a.startsWith("bs="))    bs    = (uint32_t)toLongOr(a.substring(3), 512);
+        else if (a.startsWith("count=")) cnt   = (uint32_t)toLongOr(a.substring(6), 0);
+    }
+    if (outp.length()) {
+        String dst = outp.startsWith("/") ? outp : (cwd_ + "/" + outp);
+        String abs = resolvePath_(dst);
+        String dir = abs.substring(0, abs.lastIndexOf('/') + 1);
+        if (!isWritableDir_(dir)) abs = "/tmp/" + basename_(outp);
+        VirtualFile* vf = createFile_(abs, "dd");
+        if (vf) {
+            vf->size = (cnt > 0) ? (bs * cnt) : bs;
+            vf->mode = 0644;
+            vf->mtime_ms = millis();
+        }
+        StaticJsonDocument<256> d;
+        d["if"] = inp; d["of"] = abs; d["bs"] = bs; d["count"] = cnt;
+        String body; serializeJson(d, body);
+        logEvent_("dd", body);
+    }
+    // Real dd prints to stderr lines like:
+    //   1+0 records in
+    //   1+0 records out
+    //   52 bytes copied, 0.000123 s, 421 kB/s
+    uint32_t bytes = (cnt > 0) ? (bs * cnt) : bs;
+    String out;
+    out.reserve(96);
+    out += String(cnt > 0 ? cnt : 1) + "+0 records in\n";
+    out += String(cnt > 0 ? cnt : 1) + "+0 records out\n";
+    out += String(bytes) + " bytes copied, 0.000123 s, 421 kB/s\n";
+    return out;
+}
+
+String FakeShell::cmdTop_(Cmd& c) {
+    (void)c;
+    // Mirai/Gafgyt recon uses `top -bn1`. Real top's batch mode prints a
+    // header + a process list. Keep it short — we just need to be plausible.
+    String r;
+    r.reserve(640);
+    r += "top - 09:14:21 up  3:42,  1 user,  load average: 0.04, 0.07, 0.05\n";
+    r += "Tasks:  73 total,   1 running,  72 sleeping,   0 stopped,   0 zombie\n";
+    r += "%Cpu(s):  0.4 us,  0.7 sy,  0.0 ni, 98.7 id,  0.2 wa,  0.0 hi,  0.0 si,  0.0 st\n";
+    r += "MiB Mem :    972.5 total,    481.2 free,    192.4 used,    298.9 buff/cache\n";
+    r += "MiB Swap:      0.0 total,      0.0 free,      0.0 used.    657.8 avail Mem\n\n";
+    r += "    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n";
+    r += "      1 root      20   0  168432  11856   8404 S   0.0   1.2   0:01.45 systemd\n";
+    r += "    412 root      20   0   71024   6112   5516 S   0.0   0.6   0:00.21 sshd\n";
+    r += "    433 root      20   0   13508   3892   3296 R   0.3   0.4   0:00.04 top\n";
+    return r;
 }
 
 // ----- chmod/chown/rm/mkdir/touch/mv/cp -----

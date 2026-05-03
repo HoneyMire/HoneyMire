@@ -141,6 +141,8 @@ private:
     String cmdCurl_(Cmd& c);
     String cmdTftp_(Cmd& c);
     String cmdFtpget_(Cmd& c);
+    String cmdDd_(Cmd& c);
+    String cmdTop_(Cmd& c);
     String cmdChmod_(Cmd& c);
     String cmdChown_(Cmd& c);
     String cmdRm_(Cmd& c);

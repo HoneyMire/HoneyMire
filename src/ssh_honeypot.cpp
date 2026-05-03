@@ -453,6 +453,21 @@ static void ssh_listener_task(void*) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        // Heap gate: a libssh KEX needs ~32-60 KB of contiguous heap for
+        // the asymmetric crypto (mbedtls). If the largest free block is
+        // below ~55 KB, the KEX will malloc-fail mid-handshake and leave
+        // the heap fragmented further. Reject early instead — the peer
+        // sees a TCP RST rather than a half-broken SSH banner.
+        {
+            size_t largest = ESP.getMaxAllocHeap();
+            if (largest < 55 * 1024) {
+                ssh_disconnect(sess);
+                ssh_free(sess);
+                // No Serial print: under fragmentation we'd flood UART.
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+        }
         // Cap blocking time inside libssh. Without these, a peer that
         // completes the TCP handshake and then never sends another byte
         // wedges the listener forever (and pins ~100 KB of libssh heap).
