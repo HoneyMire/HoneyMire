@@ -1,7 +1,6 @@
 #include "config.h"
 
 #include <esp_sntp.h>
-#include <esp_log.h>
 
 namespace honeyopus {
 
@@ -43,13 +42,6 @@ void apply_time_config() {
 }
 
 bool ConfigStore::begin() {
-    // First-boot NVS keys legitimately don't exist yet, but Arduino-ESP32's
-    // Preferences class logs an ERROR for every missing getString/getBool.
-    // That floods the console with ~20 scary-looking "NOT_FOUND" lines on
-    // a fresh board, which makes users think something is broken. Silence
-    // the Preferences tag for the duration of load(); we still notice real
-    // failures because begin() returns false.
-    esp_log_level_set("Preferences", ESP_LOG_NONE);
     if (!prefs_.begin(NS, false)) {
         Serial.println("[cfg] NVS open failed");
         return false;
@@ -64,41 +56,57 @@ bool ConfigStore::begin() {
 }
 
 bool ConfigStore::load() {
-    cfg_.wifi_ssid       = prefs_.getString("wifi_ssid", cfg_.wifi_ssid);
-    cfg_.wifi_pass       = prefs_.getString("wifi_pass", cfg_.wifi_pass);
-    cfg_.hostname        = prefs_.getString("hostname", cfg_.hostname);
-    cfg_.telnet_banner   = prefs_.getString("tn_banner", cfg_.telnet_banner);
-    cfg_.ssh_banner      = prefs_.getString("ssh_banner", cfg_.ssh_banner);
-    cfg_.fake_hostname   = prefs_.getString("fhost", cfg_.fake_hostname);
-    cfg_.fake_user       = prefs_.getString("fuser", cfg_.fake_user);
-    cfg_.login_attempts_before_accept = prefs_.getUChar("lthresh", cfg_.login_attempts_before_accept);
-    cfg_.telnet_enabled  = prefs_.getBool("tn_en", cfg_.telnet_enabled);
-    cfg_.ssh_enabled     = prefs_.getBool("ssh_en", cfg_.ssh_enabled);
-    cfg_.dashboard_auth_enabled = prefs_.getBool("dash_en", cfg_.dashboard_auth_enabled);
-    cfg_.dashboard_user  = prefs_.getString("dash_u", cfg_.dashboard_user);
-    cfg_.dashboard_pass  = prefs_.getString("dash_p", cfg_.dashboard_pass);
-    cfg_.web_enabled     = prefs_.getBool("web_en",  cfg_.web_enabled);
-    cfg_.geoip_enabled   = prefs_.getBool("geo_en", cfg_.geoip_enabled);
-    cfg_.geoip_url       = prefs_.getString("geo_url", cfg_.geoip_url);
-    cfg_.abuseipdb_enabled = prefs_.getBool("aipdb_en", cfg_.abuseipdb_enabled);
-    cfg_.abuseipdb_key   = prefs_.getString("aipdb_k", cfg_.abuseipdb_key);
-    cfg_.abuseipdb_comment = prefs_.getString("aipdb_c", cfg_.abuseipdb_comment);
-    cfg_.otx_enabled     = prefs_.getBool("otx_en", cfg_.otx_enabled);
-    cfg_.otx_key         = prefs_.getString("otx_k", cfg_.otx_key);
-    cfg_.otx_pulse_name  = prefs_.getString("otx_p", cfg_.otx_pulse_name);
-    cfg_.otx_pulse_id    = prefs_.getString("otx_pid", cfg_.otx_pulse_id);
-    cfg_.hub_enabled     = prefs_.getBool("hub_en",  cfg_.hub_enabled);
-    cfg_.hub_url         = prefs_.getString("hub_url", cfg_.hub_url);
-    cfg_.hub_token       = prefs_.getString("hub_tok", cfg_.hub_token);
-    cfg_.tz              = prefs_.getString("tz",     cfg_.tz);
-    cfg_.ntp_server1     = prefs_.getString("ntp1",   cfg_.ntp_server1);
-    cfg_.ntp_server2     = prefs_.getString("ntp2",   cfg_.ntp_server2);
-    cfg_.ntp_server3     = prefs_.getString("ntp3",   cfg_.ntp_server3);
-    cfg_.display_on_seconds  = prefs_.getUShort("disp_on", cfg_.display_on_seconds);
-    cfg_.attack_icon_seconds = prefs_.getUShort("disp_atk", cfg_.attack_icon_seconds);
-    cfg_.max_sessions    = prefs_.getUShort("max_sess", cfg_.max_sessions);
-    cfg_.max_attack_entries = prefs_.getUShort("max_atk", cfg_.max_attack_entries);
-    cfg_.max_session_dir_kb = prefs_.getUShort("max_skb", cfg_.max_session_dir_kb);
+    // Wrappers that skip the get*() path when the key doesn't exist yet.
+    // Arduino-ESP32's Preferences class log_e()'s a NOT_FOUND error from
+    // every get on a missing key, which floods the console with ~20
+    // scary-looking lines on first boot. isKey() is silent.
+    auto getStr  = [&](const char* k, const String& def) -> String {
+        return prefs_.isKey(k) ? prefs_.getString(k) : def;
+    };
+    auto getU8   = [&](const char* k, uint8_t  def) {
+        return prefs_.isKey(k) ? prefs_.getUChar(k)  : def;
+    };
+    auto getU16  = [&](const char* k, uint16_t def) {
+        return prefs_.isKey(k) ? prefs_.getUShort(k) : def;
+    };
+    auto getBool = [&](const char* k, bool     def) {
+        return prefs_.isKey(k) ? prefs_.getBool(k)   : def;
+    };
+    cfg_.wifi_ssid       = getStr("wifi_ssid", cfg_.wifi_ssid);
+    cfg_.wifi_pass       = getStr("wifi_pass", cfg_.wifi_pass);
+    cfg_.hostname        = getStr("hostname",  cfg_.hostname);
+    cfg_.telnet_banner   = getStr("tn_banner", cfg_.telnet_banner);
+    cfg_.ssh_banner      = getStr("ssh_banner",cfg_.ssh_banner);
+    cfg_.fake_hostname   = getStr("fhost",     cfg_.fake_hostname);
+    cfg_.fake_user       = getStr("fuser",     cfg_.fake_user);
+    cfg_.login_attempts_before_accept = getU8("lthresh", cfg_.login_attempts_before_accept);
+    cfg_.telnet_enabled  = getBool("tn_en",  cfg_.telnet_enabled);
+    cfg_.ssh_enabled     = getBool("ssh_en", cfg_.ssh_enabled);
+    cfg_.dashboard_auth_enabled = getBool("dash_en", cfg_.dashboard_auth_enabled);
+    cfg_.dashboard_user  = getStr("dash_u", cfg_.dashboard_user);
+    cfg_.dashboard_pass  = getStr("dash_p", cfg_.dashboard_pass);
+    cfg_.web_enabled     = getBool("web_en",  cfg_.web_enabled);
+    cfg_.geoip_enabled   = getBool("geo_en", cfg_.geoip_enabled);
+    cfg_.geoip_url       = getStr("geo_url", cfg_.geoip_url);
+    cfg_.abuseipdb_enabled = getBool("aipdb_en", cfg_.abuseipdb_enabled);
+    cfg_.abuseipdb_key   = getStr("aipdb_k", cfg_.abuseipdb_key);
+    cfg_.abuseipdb_comment = getStr("aipdb_c", cfg_.abuseipdb_comment);
+    cfg_.otx_enabled     = getBool("otx_en", cfg_.otx_enabled);
+    cfg_.otx_key         = getStr("otx_k",   cfg_.otx_key);
+    cfg_.otx_pulse_name  = getStr("otx_p",   cfg_.otx_pulse_name);
+    cfg_.otx_pulse_id    = getStr("otx_pid", cfg_.otx_pulse_id);
+    cfg_.hub_enabled     = getBool("hub_en",  cfg_.hub_enabled);
+    cfg_.hub_url         = getStr("hub_url",  cfg_.hub_url);
+    cfg_.hub_token       = getStr("hub_tok",  cfg_.hub_token);
+    cfg_.tz              = getStr("tz",       cfg_.tz);
+    cfg_.ntp_server1     = getStr("ntp1",     cfg_.ntp_server1);
+    cfg_.ntp_server2     = getStr("ntp2",     cfg_.ntp_server2);
+    cfg_.ntp_server3     = getStr("ntp3",     cfg_.ntp_server3);
+    cfg_.display_on_seconds  = getU16("disp_on",  cfg_.display_on_seconds);
+    cfg_.attack_icon_seconds = getU16("disp_atk", cfg_.attack_icon_seconds);
+    cfg_.max_sessions    = getU16("max_sess", cfg_.max_sessions);
+    cfg_.max_attack_entries = getU16("max_atk", cfg_.max_attack_entries);
+    cfg_.max_session_dir_kb = getU16("max_skb", cfg_.max_session_dir_kb);
     return true;
 }
 
