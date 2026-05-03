@@ -120,8 +120,11 @@ never blocked. Each captured attack triggers:
    any URL returning `country/city/lat/lon/isp` works).
 2. **AbuseIPDB** — submitted with categories `18` (brute-force), `22` (SSH)
    and `23` (IoT-targeted) and your custom comment.
-3. **AlienVault OTX** — a private one-IP pulse per attack tagged
-   `honeypot/brute-force/<proto>`.
+3. **AlienVault OTX** — every captured IP is added as an indicator to a
+   single, long-lived pulse tagged `honeypot/brute-force/<proto>`. The
+   pulse id is pinned in *Config* (field *OTX pulse id*) so the same feed
+   keeps growing across reboots. Leave it empty to fall back to
+   create-by-name behaviour.
 
 Both are off by default. Enable them in *Config* and paste your API keys.
 **Attacks coming from LAN/private IPs are never reported** to either service.
@@ -140,6 +143,48 @@ asciinema play 42.cast
 The ring-buffer is sized by `max_sessions` (default 50) — older files are
 deleted on boot.
 
+## Shell emulation
+
+The fake shell impersonates an Ubuntu 18.04 box with a small in-memory VFS
+and ~50 commands. It never executes anything on the host — every output is
+synthesised — but enough is implemented to keep Mirai/Gafgyt-style loaders
+running through their full infection chain so the recording is interesting:
+
+* `wget`, `curl`, `tftp`, `ftpget` stage virtual binaries (with realistic
+  `Saving to:` / progress output) into the VFS; `chmod +x` then `./file`
+  triggers an *executed* event tagged with the source URL and a guessed
+  arch (`arm`, `mips`, `x86`…).
+* `/bin/busybox <APPLET>` answers `applet not found` for unknown applets
+  (that's how real BusyBox replies — bots use it as a fingerprint).
+* Mirai's post-auth probe sequence (`enable`, `shell`, `system`,
+  `linuxshell`) returns silently, like a real sub-shell.
+* `dd if=… of=… bs=… count=…` creates the output file and prints the
+  proper `N+0 records in/out / NN bytes copied` trio.
+* Plausible reads for `/etc/passwd`, `/etc/shadow` (root only),
+  `/etc/os-release`, `/etc/machine-id`, `/proc/net/route`,
+  `/proc/net/tcp`, `/proc/cpuinfo`, …
+* Pipes, redirections (`>`, `>>`, `2>&1`), command separators
+  (`;`, `&&`, `||`), single/double quoting and backslash escapes are all
+  parsed. Per-command structured events are written next to the asciicast
+  in a `.events.jsonl` file.
+
+## Stability & abuse-resistance
+
+* **Per-IP cooldown gate** — repeat connections from the same IP within
+  the cooldown window are dropped at accept time, before libssh KEX or
+  the Telnet shell are spawned. Gated counts are visible on the
+  `[health]` serial line.
+* **SSH heap gate** — when the largest free heap block drops below
+  ~55 KB the SSH listener silently rejects new connections (libssh+mbedTLS
+  KEX needs that much contiguous memory). Acceptance resumes automatically
+  once the heap recovers.
+* **Heap watchdog** — if free heap stays under 45 KB for 90 s the device
+  reboots itself.
+* **Health line** — every 30 s the serial log prints
+  `up=… heap=… largest=… min=… mode=… ip=… ssh=… tn_act=… tn=N/M ssh=N/M web=…`
+  showing uptime, heap stats, telnet/ssh accept and gated counters and
+  dashboard request count.
+
 ## Layout
 
 ```
@@ -152,7 +197,9 @@ src/
   attack_log.{h,cpp}      JSONL attack log
   attack_classifier.{h,cpp}  bot vs. script vs. human heuristics
   asciinema.{h,cpp}       asciicast v2 writer
-  fake_shell.{h,cpp}      Cowrie-lite shell shared by Telnet & SSH
+  fake_shell.{h,cpp}      Medium-interaction Ubuntu 18.04 shell emulator
+                          (VFS, ~50 commands, downloader/stager detection,
+                          shared by Telnet & SSH)
   telnet_honeypot.{h,cpp}
   ssh_honeypot.{h,cpp}    libssh-esp32 server
   geoip.{h,cpp}
@@ -186,9 +233,9 @@ To enable the site on a fresh fork, go to *Settings → Pages* and set
 This is a deliberately exposed-to-the-internet honeypot. Run it on a network
 segment you do not care about, behind NAT with **only** ports 22/23
 forwarded. Disable SSH or Telnet from the dashboard if you don't want one.
-The fake shell never executes anything — it returns canned strings — but
-nothing in this project is hardened for production use against a determined
-adversary.
+The fake shell never touches the real filesystem or network — every
+response is synthesised — but nothing in this project is hardened for
+production use against a determined adversary.
 
 ## License
 
