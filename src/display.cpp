@@ -37,6 +37,7 @@ void Display::powerOff_()    { on_ = false; }
 void Display::off()          {}
 void Display::showBootLogo(uint32_t) {}
 void Display::showAttack(AttackKind) {}
+void Display::renderAttack_(AttackKind) {}
 void Display::showStatus(const String&, const String&, const String&) {}
 void Display::renderStatus_() {}
 void Display::wakeFromButton() {}
@@ -100,6 +101,13 @@ void Display::showBootLogo(uint32_t hold_ms) {
 
 void Display::showAttack(AttackKind k) {
     if (k == AttackKind::None) return;
+    // Safe from any task: just stage the request. loop() will render
+    // it on the main task that owns the I2C/SPI bus.
+    pending_attack_ = k;
+}
+
+void Display::renderAttack_(AttackKind k) {
+    if (k == AttackKind::None) return;
     attack_kind_ = k;
     powerOn_();
     u8g2.clearBuffer();
@@ -147,6 +155,12 @@ void Display::wakeFromButton() {
 }
 
 void Display::loop() {
+    // Drain cross-task render requests on the main task before any rendering.
+    AttackKind atk = pending_attack_;
+    if (atk != AttackKind::None) {
+        pending_attack_ = AttackKind::None;
+        renderAttack_(atk);
+    }
     bool pressed = digitalRead(HONEYOPUS_BUTTON_PIN) == LOW;
     uint32_t now = millis();
     if (pressed != !btn_last_state_) {
@@ -363,6 +377,14 @@ void Display::showBootLogo(uint32_t hold_ms) {
 
 void Display::showAttack(AttackKind k) {
     if (k == AttackKind::None) return;
+    // Safe from any task: stage the request; loop() will render it on
+    // the main task that owns the SPI bus (LovyanGFX is not re-entrant
+    // across tasks — see HoneyOpus issue / decoded backtrace).
+    pending_attack_ = k;
+}
+
+void Display::renderAttack_(AttackKind k) {
+    if (k == AttackKind::None) return;
     attack_kind_ = k;
     powerOn_();
     bool ssh = (k == AttackKind::SSH);
@@ -415,6 +437,12 @@ void Display::wakeFromButton() {
 }
 
 void Display::loop() {
+    // Drain cross-task render requests on the main task before any rendering.
+    AttackKind atk = pending_attack_;
+    if (atk != AttackKind::None) {
+        pending_attack_ = AttackKind::None;
+        renderAttack_(atk);
+    }
     bool pressed = digitalRead(HONEYOPUS_BUTTON_PIN) == LOW;
     uint32_t now = millis();
     if (pressed != !btn_last_state_) {

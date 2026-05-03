@@ -12,6 +12,11 @@ public:
     void loop();                       // call from main loop
 
     void showBootLogo(uint32_t hold_ms = 1500);
+
+    // Safe to call from any task (AsyncTCP, libssh, WiFi events, ...).
+    // Actual rendering is deferred to loop(), which runs on the main task
+    // that owns the SPI/I2C bus. This prevents cross-task races on the
+    // display driver's internal mutex (LovyanGFX/SPI in particular).
     void showAttack(AttackKind k);     // flashes icon for cfg.attack_icon_seconds
     void showStatus(const String& l1,
                     const String& l2 = "",
@@ -23,6 +28,7 @@ public:
 
 private:
     void renderStatus_();
+    void renderAttack_(AttackKind k);
     void powerOff_();
     void powerOn_();
 
@@ -35,6 +41,9 @@ private:
 
     bool      btn_last_state_ = true;  // active-low; pulled-up
     uint32_t  btn_last_change_ = 0;
+
+    // Cross-task render request (set from any task; consumed by loop()).
+    volatile AttackKind pending_attack_ = AttackKind::None;
 };
 
 extern Display g_display;
