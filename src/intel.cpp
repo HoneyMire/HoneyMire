@@ -313,18 +313,20 @@ bool intel_report_otx(AttackEntry& e) {
 
     WiFiClientSecure cs; cs.setInsecure();
     HTTPClient http;
-    // OTX's documented endpoint for appending indicators to an existing pulse
-    // is /pulses/{id}/indicators/bulk_create (POST, body: {"indicators":[...]})
-    // — NOT /pulses/{id}/indicators/, which silently 404s and was the reason
-    // our feed went quiet after the initial seed indicator.
-    String url = "https://otx.alienvault.com/api/v1/pulses/" + pulse_id + "/indicators/bulk_create";
+    // The OTX Python SDK (AlienVault-OTX/OTX-Python-SDK, OTXv2.py
+    // add_pulse_indicators -> edit_pulse) shows the correct way to append
+    // indicators to an existing pulse is a PATCH on /api/v1/pulses/{id}
+    // with body {"indicators": {"add": [ ... ]}}. The intuitive-looking
+    // /pulses/{id}/indicators/ and /pulses/{id}/indicators/bulk_create
+    // routes both 404 — they're not real endpoints.
+    String url = "https://otx.alienvault.com/api/v1/pulses/" + pulse_id;
     if (!http.begin(cs, url.c_str())) { xSemaphoreGive(s_otx_mtx); return false; }
     http.addHeader("X-OTX-API-KEY", cfg.otx_key);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(10000);
 
     JsonDocument d;
-    JsonArray inds = d["indicators"].to<JsonArray>();
+    JsonArray inds = d["indicators"]["add"].to<JsonArray>();
     JsonObject i = inds.add<JsonObject>();
     i["type"]      = "IPv4";
     i["indicator"] = e.ip;
@@ -361,7 +363,8 @@ bool intel_report_otx(AttackEntry& e) {
     i["description"] = desc;
 
     String body; serializeJson(d, body);
-    int code = http.POST(body);
+    // HTTPClient has no .PATCH() helper; use sendRequest("PATCH", ...).
+    int code = http.sendRequest("PATCH", (uint8_t*)body.c_str(), body.length());
     String resp = http.getString();
     http.end();
     xSemaphoreGive(s_otx_mtx);
