@@ -313,7 +313,11 @@ bool intel_report_otx(AttackEntry& e) {
 
     WiFiClientSecure cs; cs.setInsecure();
     HTTPClient http;
-    String url = "https://otx.alienvault.com/api/v1/pulses/" + pulse_id + "/indicators/";
+    // OTX's documented endpoint for appending indicators to an existing pulse
+    // is /pulses/{id}/indicators/bulk_create (POST, body: {"indicators":[...]})
+    // — NOT /pulses/{id}/indicators/, which silently 404s and was the reason
+    // our feed went quiet after the initial seed indicator.
+    String url = "https://otx.alienvault.com/api/v1/pulses/" + pulse_id + "/indicators/bulk_create";
     if (!http.begin(cs, url.c_str())) { xSemaphoreGive(s_otx_mtx); return false; }
     http.addHeader("X-OTX-API-KEY", cfg.otx_key);
     http.addHeader("Content-Type", "application/json");
