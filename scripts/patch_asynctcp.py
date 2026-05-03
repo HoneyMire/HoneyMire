@@ -22,7 +22,7 @@ import os
 import re
 import sys
 
-SENTINEL = "// HoneyOpus: null-check malloc patch v1\n"
+SENTINEL = "// HoneyOpus: null-check malloc patch v2\n"
 
 
 def patch_file(path: str) -> bool:
@@ -74,6 +74,25 @@ def patch_file(path: str) -> bool:
         last = m.end()
     out.append(src[last:])
     new_src = "".join(out)
+
+    # Second pass: NULL-guard the static dispatchers that lwIP / async_tcp
+    # call. After AsyncServer::end() sets tcp_arg(pcb, NULL) there can still
+    # be a pending SYN in flight whose accept callback fires with arg=NULL;
+    # _s_accept then does reinterpret_cast<AsyncServer*>(NULL)->_accept and
+    # we crash with a Load access fault. Same risk for the other dispatchers.
+    static_guards = [
+        ("int8_t AsyncServer::_s_accept(void * arg, tcp_pcb * pcb, int8_t err){\n",
+         "    if (!arg) { if (pcb) tcp_abort(pcb); return ERR_ABRT; }\n"),
+        ("int8_t AsyncServer::_s_accepted(void *arg, AsyncClient* client){\n",
+         "    if (!arg) { return ERR_OK; }\n"),
+        ("int8_t AsyncClient::_s_connected(void * arg, void * pcb, int8_t err){\n",
+         "    if (!arg) { return ERR_OK; }\n"),
+        ("int8_t AsyncClient::_s_lwip_fin(void * arg, struct tcp_pcb * pcb, int8_t err) {\n",
+         "    if (!arg) { return ERR_OK; }\n"),
+    ]
+    for sig, guard in static_guards:
+        if sig in new_src and (sig + guard) not in new_src:
+            new_src = new_src.replace(sig, sig + guard, 1)
 
     if new_src == src:
         return False
