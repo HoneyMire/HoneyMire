@@ -67,13 +67,18 @@ public:
 
 private:
     void persistAppend_(const AttackEntry& e);    // serialise one entry as JSONL
-    void rewriteAll_();                           // dump cache to file (used at cap-trim)
+    void rewriteAllSnapshot_(const std::vector<AttackEntry>& snap); // dump snapshot to file
     void enforceCap_();                           // keep cache within max_attack_entries
+    void enqueuePersist_(uint32_t id);            // notify persister task
+    static void persistTaskTrampoline_(void* arg);
+    void persistTaskRun_();
     std::vector<AttackEntry> entries_;            // newest-first
     uint32_t next_id_ = 1;
     bool     dirty_   = false;                    // file has duplicate revisions, needs compaction
     size_t   appends_since_compact_ = 0;
     SemaphoreHandle_t mtx_ = nullptr;             // recursive
+    QueueHandle_t     persist_q_ = nullptr;       // queue of uint32_t ids; 0 = compact
+    TaskHandle_t      persist_t_ = nullptr;
 };
 
 extern AttackLog g_attack_log;

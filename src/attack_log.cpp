@@ -5,12 +5,25 @@
 #include <LittleFS.h>
 #include <algorithm>
 #include <unordered_map>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 
 namespace honeyopus {
 
 AttackLog g_attack_log;
 
 static const char* LOG_PATH = "/attacks/log.jsonl";
+
+// Persister-task tuning. The queue holds attack ids (uint32_t); a 0 sentinel
+// means "compact the file now". 16 slots is plenty for a single ESP32-C3
+// honeypot — bursts above that are extremely rare and would just block the
+// caller for a few ms (xQueueSend with timeout below).
+static const size_t   kPersistQueueLen   = 16;
+static const uint32_t kPersistEnqueueTo  = pdMS_TO_TICKS(50);
+// File-compaction triggers (moved off the producer path; the persister
+// itself decides). Mirrors the previous inline thresholds.
+static const size_t   kAppendCompactN    = 32;   // when dirty_ and counter exceeds
+static const size_t   kUpdateCompactN    = 64;   // for update-only churn
 
 namespace {
 struct LogLock {
@@ -91,35 +104,50 @@ bool AttackLog::begin() {
     // Load + dedupe by id, keeping the latest revision. The file is
     // chronological (oldest first); we walk it in order, holding a tiny
     // unordered_map to overwrite earlier revisions in place.
-    if (!fs_exists_silent(LOG_PATH)) return true;
-    File f = LittleFS.open(LOG_PATH, "r");
-    if (!f) return true;
-    std::vector<AttackEntry> chrono;
-    chrono.reserve(64);
-    std::unordered_map<uint32_t, size_t> idx;
-    size_t raw_lines = 0;
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (!line.length()) continue;
-        raw_lines++;
-        JsonDocument d;
-        if (deserializeJson(d, line) != DeserializationError::Ok) continue;
-        AttackEntry e = AttackEntry::fromJson(d.as<JsonObjectConst>());
-        if (e.id >= next_id_) next_id_ = e.id + 1;
-        auto it = idx.find(e.id);
-        if (it == idx.end()) {
-            idx[e.id] = chrono.size();
-            chrono.push_back(std::move(e));
-        } else {
-            chrono[it->second] = std::move(e);
+    if (fs_exists_silent(LOG_PATH)) {
+        File f = LittleFS.open(LOG_PATH, "r");
+        if (f) {
+            std::vector<AttackEntry> chrono;
+            chrono.reserve(64);
+            std::unordered_map<uint32_t, size_t> idx;
+            size_t raw_lines = 0;
+            while (f.available()) {
+                String line = f.readStringUntil('\n');
+                line.trim();
+                if (!line.length()) continue;
+                raw_lines++;
+                JsonDocument d;
+                if (deserializeJson(d, line) != DeserializationError::Ok) continue;
+                AttackEntry e = AttackEntry::fromJson(d.as<JsonObjectConst>());
+                if (e.id >= next_id_) next_id_ = e.id + 1;
+                auto it = idx.find(e.id);
+                if (it == idx.end()) {
+                    idx[e.id] = chrono.size();
+                    chrono.push_back(std::move(e));
+                } else {
+                    chrono[it->second] = std::move(e);
+                }
+            }
+            f.close();
+            // chrono is oldest-first; entries_ is newest-first.
+            entries_.reserve(chrono.size());
+            for (auto it = chrono.rbegin(); it != chrono.rend(); ++it) entries_.push_back(std::move(*it));
+            if (raw_lines > entries_.size()) dirty_ = true;
         }
     }
-    f.close();
-    // chrono is oldest-first; entries_ is newest-first.
-    entries_.reserve(chrono.size());
-    for (auto it = chrono.rbegin(); it != chrono.rend(); ++it) entries_.push_back(std::move(*it));
-    if (raw_lines > entries_.size()) dirty_ = true;
+
+    // Spin up the persister task once. It owns ALL file I/O so async_tcp,
+    // intel and ssh tasks never block on LittleFS while holding the
+    // attack-log mutex. Without this, a slow LittleFS write during a flood
+    // of telnet attacks freezes the dashboard for the duration of the
+    // write — empirically tens to hundreds of ms each, occasionally seconds
+    // when GC kicks in.
+    if (!persist_q_) persist_q_ = xQueueCreate(kPersistQueueLen, sizeof(uint32_t));
+    if (!persist_t_) {
+        xTaskCreatePinnedToCore(&AttackLog::persistTaskTrampoline_,
+                                "alog-persist",
+                                4096, this, 1, &persist_t_, tskNO_AFFINITY);
+    }
     return true;
 }
 
@@ -131,17 +159,19 @@ void AttackLog::persistAppend_(const AttackEntry& e) {
     // wasn't successfully registered, and the RAII close in our destructor
     // then trips an `lfs_mlist_isopen` assert and reboots the device. Skip
     // the persist write in that window — the in-RAM cache still has the
-    // entry, and we'll compact-flush it later via rewriteAll_() once heap
-    // recovers. dirty_ keeps that compaction from being skipped.
+    // entry, and we'll compact-flush it later via rewriteAllSnapshot_()
+    // once heap recovers. dirty_ keeps that compaction from being skipped.
     if (ESP.getFreeHeap() < 12 * 1024) {
         Serial.printf("[log] append skipped — heap low (%u)\n",
                       (unsigned)ESP.getFreeHeap());
+        LogLock lk(mtx_);
         dirty_ = true;
         return;
     }
     File f = LittleFS.open(LOG_PATH, "a");
     if (!f) {
         Serial.printf("[log] append open failed for %s\n", LOG_PATH);
+        LogLock lk(mtx_);
         dirty_ = true;
         return;
     }
@@ -159,11 +189,14 @@ void AttackLog::enforceCap_() {
     if (entries_.size() > cap) entries_.resize(cap);
 }
 
-void AttackLog::rewriteAll_() {
+void AttackLog::rewriteAllSnapshot_(const std::vector<AttackEntry>& snap) {
+    // No lock held during the write — the caller passes a snapshot copy.
+    // Concurrent appends that happen mid-rewrite will be re-persisted by
+    // the next OP, and dedupe-on-load handles the duplicate lines.
     File f = LittleFS.open(LOG_PATH, "w");
     if (!f) return;
     // Persist oldest-first to keep the file chronologically ordered.
-    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+    for (auto it = snap.rbegin(); it != snap.rend(); ++it) {
         JsonDocument d;
         JsonObject o = d.to<JsonObject>();
         it->toJson(o);
@@ -171,41 +204,87 @@ void AttackLog::rewriteAll_() {
         f.println();
     }
     f.close();
-    dirty_ = false;
-    appends_since_compact_ = 0;
+    {
+        LogLock lk(mtx_);
+        dirty_ = false;
+        appends_since_compact_ = 0;
+    }
+}
+
+void AttackLog::enqueuePersist_(uint32_t id) {
+    if (!persist_q_) return;
+    // Best-effort: if the persister is far behind we'd rather drop a queue
+    // notification than block the producer (telnet disconnect runs on the
+    // async_tcp task and MUST NOT stall). Worst case the entry stays only
+    // in RAM and gets flushed by the next compaction trigger.
+    (void)xQueueSend(persist_q_, &id, kPersistEnqueueTo);
 }
 
 void AttackLog::append(const AttackEntry& e) {
-    LogLock lk(mtx_);
-    entries_.insert(entries_.begin(), e);
-    enforceCap_();
-    persistAppend_(e);
-    appends_since_compact_++;
-    // Compact the file when it has accumulated enough duplicate-revision
-    // lines that re-reading it at next boot would be wasteful. Threshold
-    // tracks both raw appends and the dirty flag.
-    if (dirty_ && appends_since_compact_ >= 32) {
-        rewriteAll_();
+    {
+        LogLock lk(mtx_);
+        entries_.insert(entries_.begin(), e);
+        enforceCap_();
+        appends_since_compact_++;
     }
+    enqueuePersist_(e.id);
 }
 
 void AttackLog::update(const AttackEntry& e) {
-    LogLock lk(mtx_);
-    bool found = false;
-    for (auto& it : entries_) {
-        if (it.id == e.id) { it = e; found = true; break; }
+    {
+        LogLock lk(mtx_);
+        bool found = false;
+        for (auto& it : entries_) {
+            if (it.id == e.id) { it = e; found = true; break; }
+        }
+        if (!found) {
+            entries_.insert(entries_.begin(), e);
+            enforceCap_();
+        }
+        // Append-only on disk: write the latest revision as a new line. Reads
+        // come from the in-RAM cache so they're unaffected; on next boot we
+        // dedupe.
+        dirty_ = true;
+        appends_since_compact_++;
     }
-    if (!found) {
-        entries_.insert(entries_.begin(), e);
-        enforceCap_();
-    }
-    // Append-only: write the latest revision as a new line. Reads come from
-    // the in-RAM cache so they're unaffected; on next boot we dedupe.
-    persistAppend_(e);
-    dirty_ = true;
-    appends_since_compact_++;
-    if (appends_since_compact_ >= 64) {
-        rewriteAll_();
+    enqueuePersist_(e.id);
+}
+
+void AttackLog::persistTaskTrampoline_(void* arg) {
+    static_cast<AttackLog*>(arg)->persistTaskRun_();
+}
+
+void AttackLog::persistTaskRun_() {
+    for (;;) {
+        uint32_t id = 0;
+        if (xQueueReceive(persist_q_, &id, portMAX_DELAY) != pdTRUE) continue;
+        if (id != 0) {
+            // Snapshot the entry under the lock, then write without it.
+            AttackEntry snap;
+            bool have = false;
+            {
+                LogLock lk(mtx_);
+                for (auto& it : entries_) {
+                    if (it.id == id) { snap = it; have = true; break; }
+                }
+            }
+            if (have) persistAppend_(snap);
+        }
+
+        // Compaction decision (counter-based, mirrors the previous inline
+        // thresholds). Take a snapshot of the entries vector under the
+        // lock, then write it without holding the lock.
+        bool need_compact = false;
+        std::vector<AttackEntry> snap;
+        {
+            LogLock lk(mtx_);
+            const size_t threshold = dirty_ ? kAppendCompactN : kUpdateCompactN;
+            if (appends_since_compact_ >= threshold) {
+                need_compact = true;
+                snap = entries_;
+            }
+        }
+        if (need_compact) rewriteAllSnapshot_(snap);
     }
 }
 
