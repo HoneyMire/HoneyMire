@@ -66,6 +66,10 @@ void setup() {
     Serial.setRxBufferSize(512);
     Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT
+    // HWCDC blocks on TX when the host hasn't opened the port yet. Drop
+    // characters instead of stalling the loop task — much safer for a
+    // headless honeypot that may run for weeks without anyone attached.
+    Serial.setTxTimeoutMs(0);
     // Wait briefly for the host to open the CDC port; bail after 800 ms so
     // headless / power-only deployments still boot promptly.
     for (uint32_t t0 = millis(); !Serial && (millis() - t0) < 800; ) {

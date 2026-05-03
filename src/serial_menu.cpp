@@ -167,9 +167,28 @@ void serial_menu_begin() {
 }
 
 void serial_menu_loop() {
-    while (Serial.available()) {
+    // Periodic liveness/diagnostic. On the ESP32-S3 with USB-Serial-JTAG
+    // (HWCDC), some hosts/terminals fail to forward keystrokes even when
+    // TX works fine. This heartbeat lets the user see the menu task is
+    // alive, the current state, and how many bytes the HWCDC RX queue
+    // is exposing — invaluable for diagnosing "menu doesn't react"
+    // reports without needing a JTAG probe. Stays quiet once any byte
+    // has actually been read so it never spams a working interactive
+    // session.
+    static uint32_t s_last_hb = 0;
+    static bool s_seen_input = false;
+    uint32_t now = millis();
+    if (!s_seen_input && (now - s_last_hb) > 10000) {
+        s_last_hb = now;
+        Serial.printf(
+            "\r\n[serial_menu] alive state=%d avail=%d  (press 'm' or Enter to open menu)\r\n",
+            (int)s_state, Serial.available());
+    }
+
+    while (Serial.available() > 0) {
         int b = Serial.read();
         if (b < 0) break;
+        s_seen_input = true;
         char c = (char)b;
         if (s_state == State::Idle) {
             if (c == 'm' || c == 'M' || c == '\r' || c == '\n' || c == '?') {
