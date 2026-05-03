@@ -110,5 +110,33 @@ void loop() {
     serial_menu_loop();
     wifi_loop();
     g_display.loop();
+
+    // Periodic health beacon. Without this, when the user reports "web is
+    // gone" we have nothing to correlate against — AsyncTCP's lone
+    // `rx timeout 4` line is benign (it's just an idle keep-alive being
+    // reaped). Logging heap, mode and uptime every 30 s lets us tell apart
+    // heap exhaustion, WiFi loss, AsyncTCP wedging and "device is fine,
+    // browser tab is stale".
+    static uint32_t last_health = 0;
+    uint32_t now = millis();
+    if (now - last_health > 30000) {
+        last_health = now;
+        const char* mode = "?";
+        switch (wifi_mode()) {
+            case NetMode::Boot:          mode = "boot"; break;
+            case NetMode::ConnectingSTA: mode = "sta-conn"; break;
+            case NetMode::OnlineSTA:     mode = "sta"; break;
+            case NetMode::FallbackAP:    mode = "ap"; break;
+        }
+        Serial.printf("[health] up=%us heap=%u largest=%u min=%u mode=%s ip=%s ssh=%d\n",
+                      (unsigned)(now / 1000),
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getMaxAllocHeap(),
+                      (unsigned)ESP.getMinFreeHeap(),
+                      mode,
+                      wifi_ip_string().c_str(),
+                      ssh_listener_running() ? 1 : 0);
+    }
+
     delay(5);
 }
