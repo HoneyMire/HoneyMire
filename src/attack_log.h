@@ -44,13 +44,15 @@ struct AttackEntry {
     static AttackEntry fromJson(JsonObjectConst o);
 };
 
-// Append-and-truncate JSONL log of attacks at /attacks/log.jsonl.
+// In-RAM cache of recent attacks, persisted to /attacks/log.jsonl.
+// Reads (recent / count / getById) hit memory only — they never block on
+// LittleFS, so async_tcp can't be starved by file I/O on the intel task.
 class AttackLog {
 public:
     bool begin();
     uint32_t nextId();
     void append(const AttackEntry& e);
-    void update(const AttackEntry& e);            // rewrite by id (rewrites whole file)
+    void update(const AttackEntry& e);            // replace-by-id in cache + append delta line
     std::vector<AttackEntry> recent(size_t limit);
     bool getById(uint32_t id, AttackEntry& out);
     size_t count();
@@ -58,10 +60,14 @@ public:
     void clearAll();
 
 private:
-    void rewriteAll_(const std::vector<AttackEntry>& v);
+    void persistAppend_(const AttackEntry& e);    // serialise one entry as JSONL
+    void rewriteAll_();                           // dump cache to file (used at cap-trim)
+    void enforceCap_();                           // keep cache within max_attack_entries
+    std::vector<AttackEntry> entries_;            // newest-first
     uint32_t next_id_ = 1;
-    size_t   line_count_ = 0;       // tracked locally to avoid scanning the file on every append
-    SemaphoreHandle_t mtx_ = nullptr;  // recursive: serialises all public ops + file IO
+    bool     dirty_   = false;                    // file has duplicate revisions, needs compaction
+    size_t   appends_since_compact_ = 0;
+    SemaphoreHandle_t mtx_ = nullptr;             // recursive
 };
 
 extern AttackLog g_attack_log;

@@ -83,32 +83,49 @@ AttackEntry AttackEntry::fromJson(JsonObjectConst o) {
 bool AttackLog::begin() {
     if (!mtx_) mtx_ = xSemaphoreCreateRecursiveMutex();
     LogLock lk(mtx_);
-    // Discover next id and line count by scanning the log. Silent probe first
-    // so first boot doesn't spam vfs_api ERROR logs.
     next_id_ = 1;
-    line_count_ = 0;
+    entries_.clear();
+    appends_since_compact_ = 0;
+    dirty_ = false;
+
+    // Load + dedupe by id, keeping the latest revision. The file is
+    // chronological (oldest first); we walk it in order, holding a tiny
+    // unordered_map to overwrite earlier revisions in place.
     if (!fs_exists_silent(LOG_PATH)) return true;
     File f = LittleFS.open(LOG_PATH, "r");
     if (!f) return true;
+    std::vector<AttackEntry> chrono;
+    chrono.reserve(64);
+    std::unordered_map<uint32_t, size_t> idx;
+    size_t raw_lines = 0;
     while (f.available()) {
         String line = f.readStringUntil('\n');
         line.trim();
         if (!line.length()) continue;
-        line_count_++;
+        raw_lines++;
         JsonDocument d;
-        if (deserializeJson(d, line) == DeserializationError::Ok) {
-            uint32_t id = d["id"] | 0;
-            if (id >= next_id_) next_id_ = id + 1;
+        if (deserializeJson(d, line) != DeserializationError::Ok) continue;
+        AttackEntry e = AttackEntry::fromJson(d.as<JsonObjectConst>());
+        if (e.id >= next_id_) next_id_ = e.id + 1;
+        auto it = idx.find(e.id);
+        if (it == idx.end()) {
+            idx[e.id] = chrono.size();
+            chrono.push_back(std::move(e));
+        } else {
+            chrono[it->second] = std::move(e);
         }
     }
     f.close();
+    // chrono is oldest-first; entries_ is newest-first.
+    entries_.reserve(chrono.size());
+    for (auto it = chrono.rbegin(); it != chrono.rend(); ++it) entries_.push_back(std::move(*it));
+    if (raw_lines > entries_.size()) dirty_ = true;
     return true;
 }
 
 uint32_t AttackLog::nextId() { LogLock lk(mtx_); return next_id_++; }
 
-void AttackLog::append(const AttackEntry& e) {
-    LogLock lk(mtx_);
+void AttackLog::persistAppend_(const AttackEntry& e) {
     File f = LittleFS.open(LOG_PATH, "a");
     if (!f) {
         Serial.printf("[log] append open failed for %s\n", LOG_PATH);
@@ -120,114 +137,19 @@ void AttackLog::append(const AttackEntry& e) {
     serializeJson(d, f);
     f.println();
     f.close();
-    line_count_++;
+}
 
-    // Trim only when actually over the cap. Avoids the costly recent(0) read on
-    // every append — that O(N) scan inside the AsyncTCP callback was killing
-    // the lwIP poll task at higher attack rates.
+void AttackLog::enforceCap_() {
     size_t cap = g_config.get().max_attack_entries;
-    if (line_count_ > cap + 16) {     // hysteresis to amortize the rewrite cost
-        auto all = recent(0);
-        if (all.size() > cap) {
-            all.resize(cap);
-            rewriteAll_(all);
-            line_count_ = all.size();
-        } else {
-            line_count_ = all.size();
-        }
-    }
+    if (cap == 0) cap = 100;
+    if (entries_.size() > cap) entries_.resize(cap);
 }
 
-void AttackLog::update(const AttackEntry& e) {
-    LogLock lk(mtx_);
-    // Append-only update: we previously read the entire log, mutated the row
-    // in memory, and rewrote the whole file. With a few hundred entries that
-    // pinned the recursive mutex for hundreds of ms, which was long enough
-    // to starve the AsyncTCP task (telnet acceptor + web handlers all call
-    // into AttackLog) and fire the 5 s task watchdog under attack flood.
-    //
-    // Now we just append the new revision; recent() dedupes by id, keeping
-    // the latest copy. The slower full rewrite happens lazily inside
-    // append()'s cap-trim path, which only runs once per ~16 new entries.
-    File f = LittleFS.open(LOG_PATH, "a");
-    if (!f) {
-        Serial.printf("[log] update open failed for %s\n", LOG_PATH);
-        return;
-    }
-    JsonDocument d;
-    JsonObject o = d.to<JsonObject>();
-    e.toJson(o);
-    serializeJson(d, f);
-    f.println();
-    f.close();
-    line_count_++;
-}
-
-std::vector<AttackEntry> AttackLog::recent(size_t limit) {
-    LogLock lk(mtx_);
-    // Read every line in chronological order, deduping by id (the latest
-    // occurrence wins — see update() above for why duplicates can exist).
-    std::vector<AttackEntry> chrono;
-    chrono.reserve(64);
-    std::unordered_map<uint32_t, size_t> idx; // id -> index in chrono
-    File f = LittleFS.open(LOG_PATH, "r");
-    if (!f) return {};
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (!line.length()) continue;
-        JsonDocument d;
-        if (deserializeJson(d, line) != DeserializationError::Ok) continue;
-        AttackEntry e = AttackEntry::fromJson(d.as<JsonObjectConst>());
-        auto it = idx.find(e.id);
-        if (it == idx.end()) {
-            idx[e.id] = chrono.size();
-            chrono.push_back(std::move(e));
-        } else {
-            chrono[it->second] = std::move(e); // overwrite, keep position
-        }
-    }
-    f.close();
-    // Newest first.
-    std::vector<AttackEntry> out;
-    out.reserve(chrono.size());
-    for (auto it = chrono.rbegin(); it != chrono.rend(); ++it) {
-        out.push_back(std::move(*it));
-    }
-    if (limit && out.size() > limit) out.resize(limit);
-    return out;
-}
-
-bool AttackLog::getById(uint32_t id, AttackEntry& out) {
-    LogLock lk(mtx_);
-    auto all = recent(0);
-    for (auto& e : all) if (e.id == id) { out = e; return true; }
-    return false;
-}
-
-size_t AttackLog::count() {
-    // Delegate to recent() so duplicates from append-only updates are
-    // collapsed; otherwise the displayed total drifts above the real number
-    // of distinct attacks.
-    return recent(0).size();
-}
-
-void AttackLog::clearAll() {
-    LogLock lk(mtx_);
-    // Truncate by reopening for write.
-    File f = LittleFS.open(LOG_PATH, "w");
-    if (f) f.close();
-    line_count_ = 0;
-    next_id_ = 1;
-}
-
-void AttackLog::rewriteAll_(const std::vector<AttackEntry>& v) {
-    LogLock lk(mtx_);
-    // recent() returns newest-first; persist oldest-first to keep the file
-    // chronologically ordered.
+void AttackLog::rewriteAll_() {
     File f = LittleFS.open(LOG_PATH, "w");
     if (!f) return;
-    for (auto it = v.rbegin(); it != v.rend(); ++it) {
+    // Persist oldest-first to keep the file chronologically ordered.
+    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
         JsonDocument d;
         JsonObject o = d.to<JsonObject>();
         it->toJson(o);
@@ -235,7 +157,69 @@ void AttackLog::rewriteAll_(const std::vector<AttackEntry>& v) {
         f.println();
     }
     f.close();
-    line_count_ = v.size();
+    dirty_ = false;
+    appends_since_compact_ = 0;
+}
+
+void AttackLog::append(const AttackEntry& e) {
+    LogLock lk(mtx_);
+    entries_.insert(entries_.begin(), e);
+    enforceCap_();
+    persistAppend_(e);
+    appends_since_compact_++;
+    // Compact the file when it has accumulated enough duplicate-revision
+    // lines that re-reading it at next boot would be wasteful. Threshold
+    // tracks both raw appends and the dirty flag.
+    if (dirty_ && appends_since_compact_ >= 32) {
+        rewriteAll_();
+    }
+}
+
+void AttackLog::update(const AttackEntry& e) {
+    LogLock lk(mtx_);
+    bool found = false;
+    for (auto& it : entries_) {
+        if (it.id == e.id) { it = e; found = true; break; }
+    }
+    if (!found) {
+        entries_.insert(entries_.begin(), e);
+        enforceCap_();
+    }
+    // Append-only: write the latest revision as a new line. Reads come from
+    // the in-RAM cache so they're unaffected; on next boot we dedupe.
+    persistAppend_(e);
+    dirty_ = true;
+    appends_since_compact_++;
+    if (appends_since_compact_ >= 64) {
+        rewriteAll_();
+    }
+}
+
+std::vector<AttackEntry> AttackLog::recent(size_t limit) {
+    LogLock lk(mtx_);
+    if (limit == 0 || limit >= entries_.size()) return entries_;
+    return std::vector<AttackEntry>(entries_.begin(), entries_.begin() + limit);
+}
+
+bool AttackLog::getById(uint32_t id, AttackEntry& out) {
+    LogLock lk(mtx_);
+    for (auto& e : entries_) if (e.id == id) { out = e; return true; }
+    return false;
+}
+
+size_t AttackLog::count() {
+    LogLock lk(mtx_);
+    return entries_.size();
+}
+
+void AttackLog::clearAll() {
+    LogLock lk(mtx_);
+    entries_.clear();
+    next_id_ = 1;
+    dirty_ = false;
+    appends_since_compact_ = 0;
+    File f = LittleFS.open(LOG_PATH, "w");
+    if (f) f.close();
 }
 
 } // namespace honeyopus
