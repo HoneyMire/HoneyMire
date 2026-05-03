@@ -57,19 +57,29 @@ static std::vector<CdEntry>  s_cd_abuse;
 static std::vector<CdEntry>  s_cd_otx;
 
 // Returns true if the IP is OUTSIDE the cooldown window (i.e. it's ok to
-// report now). On true, the entry is updated/inserted with `now`. On false,
-// the caller should skip reporting.
-static bool cooldown_check_(std::vector<CdEntry>& v, const String& ip,
+// report now). DOES NOT update state — call cooldown_commit_() only after a
+// successful 2xx response so a failed/skipped report can be retried
+// immediately instead of being suppressed for the full window.
+static bool cooldown_check_(const std::vector<CdEntry>& v, const String& ip,
                             uint32_t now, uint32_t period) {
     for (auto& e : v) {
         if (e.ip == ip) {
             if (now - e.last_sec < period) return false;
-            e.last_sec = now;
             return true;
         }
     }
+    return true;
+}
+
+// Record `ip` as having been successfully reported at `now`. Inserts a new
+// entry or refreshes the existing one; evicts the oldest entry if the
+// table is full.
+static void cooldown_commit_(std::vector<CdEntry>& v, const String& ip,
+                             uint32_t now) {
+    for (auto& e : v) {
+        if (e.ip == ip) { e.last_sec = now; return; }
+    }
     if (v.size() >= kCdMax) {
-        // evict oldest
         size_t oldest = 0;
         for (size_t i = 1; i < v.size(); ++i) {
             if (v[i].last_sec < v[oldest].last_sec) oldest = i;
@@ -77,7 +87,6 @@ static bool cooldown_check_(std::vector<CdEntry>& v, const String& ip,
         v.erase(v.begin() + oldest);
     }
     v.push_back({ip, now});
-    return true;
 }
 
 // RFC1918 / loopback / link-local / CGNAT / IPv6 ULA & link-local. We never
@@ -155,6 +164,7 @@ bool intel_report_abuseipdb(AttackEntry& e) {
     String resp = http.getString();
     http.end();
     if (code >= 200 && code < 300) {
+        cooldown_commit_(s_cd_abuse, e.ip, now);
         e.reported_abuseipdb = true;
         Serial.printf("[abuseipdb] %s reported, http=%d\n", e.ip.c_str(), code);
         return true;
@@ -353,6 +363,7 @@ bool intel_report_otx(AttackEntry& e) {
     xSemaphoreGive(s_otx_mtx);
 
     if (code >= 200 && code < 300) {
+        cooldown_commit_(s_cd_otx, e.ip, now);
         e.reported_otx = true;
         Serial.printf("[otx] %s indicator added to pulse %s, http=%d\n",
                       e.ip.c_str(), pulse_id.c_str(), code);
