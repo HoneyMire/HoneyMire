@@ -18,6 +18,10 @@
 #include <new>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+#include <esp_rom_sys.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <rom/ets_sys.h>
 
 #include "config.h"
 #include "display.h"
@@ -35,15 +39,18 @@ using namespace honeyopus;
 // Last-resort guard. AsyncWebServer / mbedTLS / ArduinoJson all use plain
 // `new` and don't catch std::bad_alloc. When heap runs out, the unhandled
 // exception unwinds straight to __cxxabiv1::__terminate which aborts with
-// a confusing register dump. Restarting the device cleanly is far better:
-// the supervising network resilvers the listener within a few seconds.
+// a confusing register dump. Restarting cleanly is far better.
+//
+// IMPORTANT: this can be called from *any* task, including from inside
+// HWCDC::write / vfprintf / FreeRTOS internals while UART or stdio mutexes
+// are held. Touching Serial.printf here would recurse into the same locks
+// and assert (lock_acquire_generic / xQueueTakeMutexRecursive). Use
+// ets_printf which writes to the ROM UART driver directly and is safe in
+// any context.
 static void honeyopus_new_handler() {
-    Serial.printf("[heap] OOM — operator new failed (free=%u, largest=%u). "
-                  "Restarting.\n",
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)ESP.getMaxAllocHeap());
-    Serial.flush();
-    delay(50);
+    ets_printf("[heap] OOM new_handler free=%u largest=%u — restart\n",
+               (unsigned)ESP.getFreeHeap(),
+               (unsigned)ESP.getMaxAllocHeap());
     esp_restart();
 }
 
@@ -57,13 +64,20 @@ void setup() {
                   ESP.getChipModel(), ESP.getChipRevision(),
                   ESP.getCpuFreqMHz(), ESP.getFreeHeap());
 
-    // Bump the global task watchdog timeout from the 5 s default to 30 s so
-    // that legitimate slow operations (LittleFS rewrites, TLS handshakes for
-    // AbuseIPDB / OTX / GeoIP) on this single-core chip don't reboot us.
-    // AsyncTCP's WDT instrumentation is compiled out in platformio.ini
-    // (CONFIG_ASYNC_TCP_USE_WDT=0) because its event handlers do inline
-    // flash I/O for asciinema cast files which can stall on GC.
-    esp_task_wdt_init(30, true);
+    // Bump the global task watchdog timeout from the 5 s default and detach
+    // CPU 0's IDLE task. ESP32-C3 is single-core: when async_tcp callbacks
+    // open or write to a fragmented LittleFS, the cast file commit can stall
+    // the CPU for several seconds during littlefs garbage collection. That
+    // starves the IDLE task and the IDLE-task WDT (subscribed by default in
+    // arduino-esp32) panics us. Flash GC is not a real lockup; the interrupt
+    // watchdog (independent, hardware) still detects genuine CPU hangs.
+    // AsyncTCP's per-event WDT subscription is already compiled out via
+    // -DCONFIG_ASYNC_TCP_USE_WDT=0 in platformio.ini.
+    esp_task_wdt_init(60, true);
+    {
+        TaskHandle_t idle0 = xTaskGetIdleTaskHandle();
+        if (idle0) esp_task_wdt_delete(idle0);
+    }
 
     g_display.begin();
     g_display.showBootLogo(2000);

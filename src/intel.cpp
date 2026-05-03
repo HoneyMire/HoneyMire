@@ -16,18 +16,21 @@
 namespace honeyopus {
 
 // mbedTLS handshake on ESP32-C3 needs roughly 30-50 KB of contiguous heap.
-// If we attempt it below this watermark the handshake fails with -32512
-// (MBEDTLS_ERR_SSL_ALLOC_FAILED) and, worse, leaves the heap fragmented in
-// a way that subsequent LittleFS opens can trip lfs_file_close asserts.
-// Skip the request rather than risk the cascade.
-static const size_t kTlsMinHeap   = 40 * 1024;
-static const size_t kFlashMinHeap = 12 * 1024;
+// Total free heap is not enough to know — under fragmentation we can have
+// 80 KB free with a largest block under 50 KB and operator new still throws.
+// Skip the request when either watermark fails to avoid the cascade
+// (handshake -32512 -> LittleFS.open partial failure -> lfs assert).
+static const size_t kTlsMinHeap        = 40 * 1024;
+static const size_t kTlsMinLargestBlk  = 38 * 1024;
+static const size_t kFlashMinHeap      = 12 * 1024;
 
 static bool heap_ok_for_tls_(const char* tag) {
     size_t free_heap = ESP.getFreeHeap();
-    if (free_heap < kTlsMinHeap) {
-        Serial.printf("[%s] skip — heap low (%u < %u)\n",
-                      tag, (unsigned)free_heap, (unsigned)kTlsMinHeap);
+    size_t largest   = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    if (free_heap < kTlsMinHeap || largest < kTlsMinLargestBlk) {
+        Serial.printf("[%s] skip — heap low (free=%u largest=%u min=%u/%u)\n",
+                      tag, (unsigned)free_heap, (unsigned)largest,
+                      (unsigned)kTlsMinHeap, (unsigned)kTlsMinLargestBlk);
         return false;
     }
     return true;

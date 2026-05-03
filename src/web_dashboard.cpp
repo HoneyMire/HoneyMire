@@ -201,13 +201,16 @@ static AwsResponseFiller make_seg_filler(std::shared_ptr<SegPage> p) {
 // `operator new` throws std::bad_alloc, which propagates out of the
 // async_tcp callback and __terminate aborts the device. Bail out early
 // with a 503 in that case — clients can retry.
-static const size_t kWebMinHeap = 24 * 1024;
+static const size_t kWebMinHeap        = 24 * 1024;
+static const size_t kWebMinLargestBlk  = 12 * 1024;
 
 static bool web_heap_ok_(AsyncWebServerRequest* req, const char* tag) {
     size_t free_heap = ESP.getFreeHeap();
-    if (free_heap < kWebMinHeap) {
-        Serial.printf("[web] 503 %s — heap low (%u < %u)\n",
-                      tag, (unsigned)free_heap, (unsigned)kWebMinHeap);
+    size_t largest   = ESP.getMaxAllocHeap();
+    if (free_heap < kWebMinHeap || largest < kWebMinLargestBlk) {
+        Serial.printf("[web] 503 %s — heap low (free=%u largest=%u min=%u/%u)\n",
+                      tag, (unsigned)free_heap, (unsigned)largest,
+                      (unsigned)kWebMinHeap, (unsigned)kWebMinLargestBlk);
         auto* r = req->beginResponse(503, "text/plain",
             "HoneyOpus is low on RAM, please retry in a few seconds.\n");
         if (r) {
