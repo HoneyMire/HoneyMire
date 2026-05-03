@@ -466,6 +466,20 @@ bool intel_report_hub(AttackEntry& e) {
 
     if (!heap_ok_for_tls_("hub")) return false;
 
+    // Catch the most common misconfiguration: pointing the ESP at
+    // "localhost" or "127.0.0.1" — that's the ESP itself, not the user's
+    // laptop. Print a clear warning instead of failing silently with
+    // http=-1 (CONNECTION_REFUSED) over and over.
+    {
+        String low = cfg.hub_url; low.toLowerCase();
+        if (low.indexOf("//localhost") >= 0 || low.indexOf("//127.") >= 0 ||
+            low.indexOf("//[::1]") >= 0) {
+            Serial.printf("[hub] WARNING: hub_url=%s — 'localhost' resolves to the ESP itself, "
+                          "not your laptop. Use the LAN IP of the hub host (e.g. 192.168.x.y).\n",
+                          cfg.hub_url.c_str());
+        }
+    }
+
     // Build payload --------------------------------------------------------
     JsonDocument doc;
     doc["schema"] = "honeyopus.attack/v1";
@@ -478,28 +492,48 @@ bool intel_report_hub(AttackEntry& e) {
     hub_fill_hardware_(hp["hardware"].to<JsonObject>());
 
     JsonObject at = doc["attack"].to<JsonObject>();
-    at["id"]            = e.id;
-    at["ts"]            = (uint32_t)e.ts;
-    at["protocol"]      = e.protocol;
-    at["src_ip"]        = e.ip;
-    at["src_port"]      = e.port;
-    at["dst_port"]      = (e.protocol == "ssh") ? HONEYOPUS_SSH_PORT : HONEYOPUS_TELNET_PORT;
-    at["user"]          = e.user;
-    at["pass"]          = e.pass;
-    at["authenticated"] = e.authenticated;
-    at["commands"]      = e.commands;
-    at["duration_ms"]   = e.duration_ms;
-    at["lan"]           = intel_ip_is_private(e.ip);
+    at["id"]          = e.id;
+    at["ts"]          = (uint32_t)e.ts;
+    at["protocol"]    = e.protocol;
+    at["duration_ms"] = e.duration_ms;
+
+    JsonObject src = at["source"].to<JsonObject>();
+    src["ip"]   = e.ip;
+    src["port"] = e.port;
+
+    JsonObject au = at["auth"].to<JsonObject>();
+    au["user"]          = e.user;
+    au["pass"]          = e.pass;
+    au["authenticated"] = e.authenticated;
 
     if (e.pubkeys.length()) {
-        JsonArray pk = at["pubkeys"].to<JsonArray>();
+        // pubkeys field stores one OpenSSH-format line per offered key:
+        //   "<type> <SHA256:fp> [base64key]"
+        // Spec §3.4.2 wants {type, fingerprint, key} objects.
+        JsonArray pk = au["ssh_pubkeys"].to<JsonArray>();
         int start = 0;
         while (start < (int)e.pubkeys.length()) {
             int nl = e.pubkeys.indexOf('\n', start);
             String line = (nl < 0) ? e.pubkeys.substring(start)
                                    : e.pubkeys.substring(start, nl);
             line.trim();
-            if (line.length()) pk.add(line);
+            if (line.length()) {
+                int sp1 = line.indexOf(' ');
+                int sp2 = (sp1 >= 0) ? line.indexOf(' ', sp1 + 1) : -1;
+                JsonObject o = pk.add<JsonObject>();
+                if (sp1 < 0) {
+                    o["type"]        = line;
+                    o["fingerprint"] = "";
+                } else if (sp2 < 0) {
+                    o["type"]        = line.substring(0, sp1);
+                    o["fingerprint"] = line.substring(sp1 + 1);
+                } else {
+                    o["type"]        = line.substring(0, sp1);
+                    o["fingerprint"] = line.substring(sp1 + 1, sp2);
+                    String key = line.substring(sp2 + 1);
+                    if (key.length() && key.length() <= 800) o["key"] = key;
+                }
+            }
             if (nl < 0) break;
             start = nl + 1;
         }
@@ -527,12 +561,32 @@ bool intel_report_hub(AttackEntry& e) {
     if (e.reported_abuseipdb) rt.add("abuseipdb");
     if (e.reported_otx)       rt.add("otx");
 
+    // attack.session — optional but recommended; carries the asciicast.
+    JsonObject ses = at["session"].to<JsonObject>();
+    ses["commands"] = e.commands;
+
     if (e.cast_path.length()) {
-        String cast;
-        bool truncated = false;
-        if (hub_load_cast_(e.cast_path, cast, truncated)) {
-            at["cast_v2"]        = cast;
-            at["cast_truncated"] = truncated;
+        // The cast_v2 field is the largest contributor to heap pressure.
+        // Building the JSON body keeps a copy of the cast in RAM, then
+        // mbedTLS needs another 30-50 KiB on top for the TLS record
+        // buffers. If we don't have enough headroom we'd rather skip
+        // the cast (the hub can still index the attack metadata) than
+        // crash or fail the whole submission.
+        size_t free_now = ESP.getFreeHeap();
+        // Need: cast bytes (1x for the file in heap, 1x for the
+        // serialised JSON copy) + ~50 KiB for TLS + 16 KiB headroom.
+        size_t need = (kHubCastMaxBytes * 2) + 50 * 1024 + 16 * 1024;
+        if (free_now < need) {
+            Serial.printf("[hub] heap tight (free=%u need=%u) — submitting without cast_v2\n",
+                          (unsigned)free_now, (unsigned)need);
+            ses["cast_truncated"] = true;
+        } else {
+            String cast;
+            bool truncated = false;
+            if (hub_load_cast_(e.cast_path, cast, truncated)) {
+                ses["cast_v2"]        = cast;
+                ses["cast_truncated"] = truncated;
+            }
         }
     }
 
@@ -546,33 +600,48 @@ bool intel_report_hub(AttackEntry& e) {
     url += "/api/v1/ingest";
 
     bool tls = url.startsWith("https://");
+    size_t free_before  = ESP.getFreeHeap();
+    size_t largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+
     HTTPClient http;
     int code = -1;
     String resp;
+    // We use the same setInsecure() pattern as the other reporters because
+    // the ESP can't realistically ship a CA bundle. Timeouts are generous
+    // because we may push up to 200 KiB to a hub on a slow link.
     if (tls) {
         WiFiClientSecure cs;
         cs.setInsecure();
-        if (!http.begin(cs, url)) return false;
+        cs.setHandshakeTimeout(15);
+        if (!http.begin(cs, url)) {
+            Serial.printf("[hub] http.begin() rejected url=%s\n", url.c_str());
+            return false;
+        }
         http.addHeader("Authorization", String("Bearer ") + cfg.hub_token);
         http.addHeader("Content-Type", "application/json; charset=utf-8");
-        http.setTimeout(15000);
+        http.setConnectTimeout(15000);
+        http.setTimeout(20000);
         code = http.POST(body);
-        resp = http.getString();
+        if (code > 0) resp = http.getString();
         http.end();
     } else {
         WiFiClient c;
-        if (!http.begin(c, url)) return false;
+        if (!http.begin(c, url)) {
+            Serial.printf("[hub] http.begin() rejected url=%s\n", url.c_str());
+            return false;
+        }
         http.addHeader("Authorization", String("Bearer ") + cfg.hub_token);
         http.addHeader("Content-Type", "application/json; charset=utf-8");
-        http.setTimeout(15000);
+        http.setConnectTimeout(15000);
+        http.setTimeout(20000);
         code = http.POST(body);
-        resp = http.getString();
+        if (code > 0) resp = http.getString();
         http.end();
     }
 
     if (code >= 200 && code < 300) {
         e.reported_hub = true;
-        Serial.printf("[hub] %s id=%u reported, http=%d (%u B)\n",
+        Serial.printf("[hub] %s id=%u reported, http=%d (%u B body)\n",
                       e.ip.c_str(), (unsigned)e.id, code, (unsigned)body.length());
         return true;
     }
@@ -584,8 +653,15 @@ bool intel_report_hub(AttackEntry& e) {
                       e.ip.c_str(), (unsigned)e.id, code, resp.c_str());
         return false;
     }
-    Serial.printf("[hub] %s id=%u failed http=%d resp=%s\n",
-                  e.ip.c_str(), (unsigned)e.id, code, resp.c_str());
+    // Negative codes from HTTPClient are connection-level failures — print
+    // the human-readable label so the user can tell DNS-failure from
+    // TLS-handshake-failure from heap-exhaustion at a glance.
+    const char* err = (code < 0) ? HTTPClient::errorToString(code).c_str() : "";
+    Serial.printf("[hub] %s id=%u failed http=%d (%s) url=%s body=%uB heap=%u/%u resp=%s\n",
+                  e.ip.c_str(), (unsigned)e.id, code, err, url.c_str(),
+                  (unsigned)body.length(),
+                  (unsigned)free_before, (unsigned)largest_before,
+                  resp.c_str());
     return false;
 }
 
