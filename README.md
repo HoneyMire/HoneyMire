@@ -14,11 +14,10 @@ bundled in.
 
 ## ✨ Install from your browser
 
-Plug an ESP32-C3 board into a USB port and head to the **GitHub Pages site**
-for this repo (enabled automatically by the workflow on each push to
-`main`/`master`). Click *Connect*, pick the serial port, and the latest
-firmware is flashed in seconds — no toolchain, no `pio`, no drivers beyond the
-stock USB-CDC.
+Plug an ESP32-C3 board into a USB port and head to
+**[kast.github.io/HoneyOpus](https://kast.github.io/HoneyOpus/)**.
+Click *Connect*, pick the serial port, and the latest firmware is flashed in
+seconds — no toolchain, no `pio`, no drivers beyond the stock USB-CDC.
 
 The flasher uses [ESP Web Tools](https://esphome.github.io/esp-web-tools/) and
 works in Chrome, Edge and Opera on a desktop computer.
