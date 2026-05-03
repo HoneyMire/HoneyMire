@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>HoneyOpus · Web Installer</title>
+<meta name="description" content="Flash the HoneyOpus ESP32-C3 honeypot firmware right from your browser."/>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext y='52' font-size='52'%3E%F0%9F%8D%AF%3C/text%3E%3C/svg%3E"/>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+:root{--bg:#0e0f13;--fg:#e7e9ee;--mut:#9098a8;--card:#171a21;--acc:#f0b429;--bad:#e94560;--good:#41d693;--bord:#262a35}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,sans-serif;background:radial-gradient(circle at 30% 0%,#1a1d27 0%,var(--bg) 60%);color:var(--fg);min-height:100vh}
+header{padding:48px 24px 16px;text-align:center}
+header h1{margin:0;font-size:42px;color:var(--acc);letter-spacing:-0.02em}
+header h1 .em{font-size:38px;margin-right:6px}
+header p.tag{margin:8px 0 0;color:var(--mut);font-size:16px}
+main{max-width:760px;margin:0 auto;padding:24px;display:grid;gap:20px}
+.card{background:var(--card);border:1px solid var(--bord);border-radius:12px;padding:24px}
+.card h2{margin:0 0 12px;font-size:18px;color:var(--acc)}
+.card p{margin:6px 0;color:var(--fg)}
+.card p.meta{color:var(--mut);font-size:13px}
+ol{padding-left:22px;margin:8px 0}
+li{margin:4px 0}
+code{background:#0c0d12;border:1px solid var(--bord);padding:1px 6px;border-radius:4px;font:13px ui-monospace,Menlo,monospace}
+.flash{display:flex;flex-direction:column;align-items:center;gap:12px;padding:28px 16px}
+esp-web-install-button{--esp-tools-button-color:#0e0f13;--esp-tools-button-text-color:#0e0f13;--esp-tools-button-border-radius:8px}
+.fallback{display:none;color:var(--bad);font-size:14px;text-align:center;max-width:520px}
+.fallback.show{display:block}
+.badges{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:8px}
+.badge{background:#0c0d12;border:1px solid var(--bord);padding:4px 10px;border-radius:999px;font-size:12px;color:var(--mut)}
+.badge b{color:var(--fg)}
+footer{padding:24px;text-align:center;color:var(--mut);font-size:12px}
+footer a{color:#7ad9ff}
+@media (max-width:520px){header h1{font-size:32px}}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="em">🍯</span>HoneyOpus</h1>
+  <p class="tag">An ESP32-C3 SSH/Telnet honeypot — installable from your browser.</p>
+  <div class="badges">
+    <span class="badge">Target: <b>ESP32-C3</b></span>
+    <span class="badge">Build: <b id="b-ver">latest</b></span>
+    <span class="badge">Built: <b id="b-date">—</b></span>
+  </div>
+</header>
+
+<main>
+
+<section class="card flash">
+  <h2 style="align-self:flex-start">Install the latest firmware</h2>
+  <p class="meta" style="align-self:flex-start;margin-top:-8px">
+    Plug your ESP32-C3 board in via USB, then click <b>Connect</b> and pick the serial port.
+  </p>
+  <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+  <div class="fallback" id="fallback">
+    Your browser can't talk to USB serial. Use a recent <b>Chrome</b>, <b>Edge</b>
+    or <b>Opera</b> on a desktop computer.
+  </div>
+</section>
+
+<section class="card">
+  <h2>What is this?</h2>
+  <p>HoneyOpus is a pocket-sized honeypot that fakes a sloppy Ubuntu server on
+     ports 22 and 23. It records every attacker session as an asciinema cast,
+     classifies the attack profile (Mirai, IoT loader, manual operator, …),
+     geolocates the source, and can optionally report to AbuseIPDB and AlienVault OTX.</p>
+</section>
+
+<section class="card">
+  <h2>After flashing</h2>
+  <ol>
+    <li>The OLED briefly shows the boot logo, then turns off.</li>
+    <li>The board comes up as a SoftAP <code>HoneyOpus-XXXXXX</code> (password
+        <code>honeyopus</code>). Connect with your phone — the captive portal
+        opens automatically.</li>
+    <li>Pick your Wi-Fi network, enter the password, hit <b>Connect</b>. The
+        device reboots and joins your LAN.</li>
+    <li>Browse to the IP shown on the OLED. Default dashboard login is
+        <code>admin</code> / <code>honeyopus</code> (LAN clients are auto-allowed
+        without auth — change the password before exposing the device).</li>
+  </ol>
+</section>
+
+<section class="card">
+  <h2>Using it safely</h2>
+  <p>Run it on a network segment you don't care about. Forward only TCP 22 and
+     23 from your router. The fake shell never executes anything — it returns
+     canned strings — but no honeypot is hardened against a determined
+     adversary. <b>Never</b> leave the default dashboard password if the device
+     is reachable from the internet.</p>
+</section>
+
+</main>
+
+<footer>
+  Made with ❤️ and a healthy dose of AI assistance.
+</footer>
+
+<script>
+if (!('serial' in navigator)) {
+  document.getElementById('fallback').classList.add('show');
+}
+fetch('manifest.json', {cache:'no-store'}).then(r=>r.json()).then(m=>{
+  if (m.version) document.getElementById('b-ver').textContent = m.version;
+  if (m.build_date) document.getElementById('b-date').textContent = m.build_date;
+}).catch(()=>{});
+</script>
+</body>
+</html>

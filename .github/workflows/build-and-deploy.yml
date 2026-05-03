@@ -1,0 +1,123 @@
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build firmware & stage site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio esptool
+
+      - name: Build firmware
+        run: pio run -e esp32-c3-oled
+
+      - name: Compose web-flasher site
+        env:
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref_name }}
+          REPO:    ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BUILD=.pio/build/esp32-c3-oled
+          BOOT_APP0=$(find "$HOME/.platformio/packages" -name boot_app0.bin -path '*/partitions/*' | head -n1)
+          if [ -z "$BOOT_APP0" ]; then
+            echo "::error::boot_app0.bin not found"
+            exit 1
+          fi
+
+          mkdir -p site
+          cp -r web/. site/
+
+          # Merge bootloader + partitions + boot_app0 + app into a single image
+          # so ESP Web Tools only needs one part at offset 0.
+          esptool.py --chip esp32c3 merge_bin \
+            -o site/firmware.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 4MB \
+            0x0000   "$BUILD/bootloader.bin" \
+            0x8000   "$BUILD/partitions.bin" \
+            0xe000   "$BOOT_APP0" \
+            0x10000  "$BUILD/firmware.bin"
+
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          SHORT_SHA=${GIT_SHA::7}
+
+          cat > site/manifest.json <<JSON
+          {
+            "name": "HoneyOpus",
+            "version": "${GIT_REF}-${SHORT_SHA}",
+            "build_date": "${BUILD_DATE}",
+            "home_assistant_domain": "honeyopus",
+            "new_install_prompt_erase": true,
+            "builds": [
+              {
+                "chipFamily": "ESP32-C3",
+                "parts": [
+                  { "path": "firmware.bin", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          JSON
+
+          # Bake the actual repo URL into the page so the link isn't a placeholder.
+          sed -i "s#REPO_PLACEHOLDER#${REPO}#g" site/index.html
+
+          ls -la site
+          echo "Merged firmware size: $(stat -c%s site/firmware.bin) bytes"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Upload firmware as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: honeyopus-firmware-${{ github.sha }}
+          path: |
+            site/firmware.bin
+            site/manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

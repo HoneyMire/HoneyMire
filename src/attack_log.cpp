@@ -1,0 +1,196 @@
+#include "attack_log.h"
+#include "config.h"
+#include "storage.h"
+
+#include <LittleFS.h>
+#include <algorithm>
+
+namespace honeyopus {
+
+AttackLog g_attack_log;
+
+static const char* LOG_PATH = "/attacks/log.jsonl";
+
+void AttackEntry::toJson(JsonObject o) const {
+    o["id"]            = id;
+    o["ts"]            = (uint32_t)ts;
+    o["protocol"]      = protocol;
+    o["ip"]            = ip;
+    o["port"]          = port;
+    o["user"]          = user;
+    o["pass"]          = pass;
+    o["pubkeys"]       = pubkeys;
+    o["authenticated"] = authenticated;
+    o["commands"]      = commands;
+    o["duration_ms"]   = duration_ms;
+    o["cast_path"]     = cast_path;
+    o["profile"]       = profile;
+    o["profile_conf"]  = profile_confidence;
+    o["country"]       = country;
+    o["country_code"]  = country_code;
+    o["city"]          = city;
+    o["region"]        = region;
+    o["isp"]           = isp;
+    o["asn"]           = asn;
+    o["lat"]           = lat;
+    o["lon"]           = lon;
+    o["geo_resolved"]  = geo_resolved;
+    o["reported_abuseipdb"] = reported_abuseipdb;
+    o["reported_otx"]  = reported_otx;
+}
+
+AttackEntry AttackEntry::fromJson(JsonObjectConst o) {
+    AttackEntry e;
+    e.id            = o["id"]            | 0;
+    e.ts            = (time_t)(o["ts"]   | 0);
+    e.protocol      = (const char*)(o["protocol"]      | "");
+    e.ip            = (const char*)(o["ip"]            | "");
+    e.port          = o["port"]          | 0;
+    e.user          = (const char*)(o["user"]          | "");
+    e.pass          = (const char*)(o["pass"]          | "");
+    e.pubkeys       = (const char*)(o["pubkeys"]       | "");
+    e.authenticated = o["authenticated"] | false;
+    e.commands      = o["commands"]      | 0;
+    e.duration_ms   = o["duration_ms"]   | 0;
+    e.cast_path     = (const char*)(o["cast_path"]     | "");
+    e.profile       = (const char*)(o["profile"]       | "");
+    e.profile_confidence = (uint8_t)(o["profile_conf"] | 0);
+    e.country       = (const char*)(o["country"]       | "");
+    e.country_code  = (const char*)(o["country_code"]  | "");
+    e.city          = (const char*)(o["city"]          | "");
+    e.region        = (const char*)(o["region"]        | "");
+    e.isp           = (const char*)(o["isp"]           | "");
+    e.asn           = (const char*)(o["asn"]           | "");
+    e.lat           = o["lat"]           | 0.0f;
+    e.lon           = o["lon"]           | 0.0f;
+    e.geo_resolved  = o["geo_resolved"]  | false;
+    e.reported_abuseipdb = o["reported_abuseipdb"] | false;
+    e.reported_otx       = o["reported_otx"]       | false;
+    return e;
+}
+
+bool AttackLog::begin() {
+    // Discover next id and line count by scanning the log. Silent probe first
+    // so first boot doesn't spam vfs_api ERROR logs.
+    next_id_ = 1;
+    line_count_ = 0;
+    if (!fs_exists_silent(LOG_PATH)) return true;
+    File f = LittleFS.open(LOG_PATH, "r");
+    if (!f) return true;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (!line.length()) continue;
+        line_count_++;
+        JsonDocument d;
+        if (deserializeJson(d, line) == DeserializationError::Ok) {
+            uint32_t id = d["id"] | 0;
+            if (id >= next_id_) next_id_ = id + 1;
+        }
+    }
+    f.close();
+    return true;
+}
+
+uint32_t AttackLog::nextId() { return next_id_++; }
+
+void AttackLog::append(const AttackEntry& e) {
+    File f = LittleFS.open(LOG_PATH, "a");
+    if (!f) {
+        Serial.printf("[log] append open failed for %s\n", LOG_PATH);
+        return;
+    }
+    JsonDocument d;
+    JsonObject o = d.to<JsonObject>();
+    e.toJson(o);
+    serializeJson(d, f);
+    f.println();
+    f.close();
+    line_count_++;
+
+    // Trim only when actually over the cap. Avoids the costly recent(0) read on
+    // every append — that O(N) scan inside the AsyncTCP callback was killing
+    // the lwIP poll task at higher attack rates.
+    size_t cap = g_config.get().max_attack_entries;
+    if (line_count_ > cap + 16) {     // hysteresis to amortize the rewrite cost
+        auto all = recent(0);
+        if (all.size() > cap) {
+            all.resize(cap);
+            rewriteAll_(all);
+            line_count_ = all.size();
+        } else {
+            line_count_ = all.size();
+        }
+    }
+}
+
+void AttackLog::update(const AttackEntry& e) {
+    auto all = recent(0);
+    bool found = false;
+    for (auto& it : all) {
+        if (it.id == e.id) { it = e; found = true; break; }
+    }
+    if (!found) all.insert(all.begin(), e);
+    rewriteAll_(all);
+}
+
+std::vector<AttackEntry> AttackLog::recent(size_t limit) {
+    std::vector<AttackEntry> out;
+    File f = LittleFS.open(LOG_PATH, "r");
+    if (!f) return out;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (!line.length()) continue;
+        JsonDocument d;
+        if (deserializeJson(d, line) == DeserializationError::Ok) {
+            out.push_back(AttackEntry::fromJson(d.as<JsonObjectConst>()));
+        }
+    }
+    f.close();
+    // Newest first.
+    std::reverse(out.begin(), out.end());
+    if (limit && out.size() > limit) out.resize(limit);
+    return out;
+}
+
+bool AttackLog::getById(uint32_t id, AttackEntry& out) {
+    auto all = recent(0);
+    for (auto& e : all) if (e.id == id) { out = e; return true; }
+    return false;
+}
+
+size_t AttackLog::count() {
+    size_t n = 0;
+    File f = LittleFS.open(LOG_PATH, "r");
+    if (!f) return 0;
+    while (f.available()) { f.readStringUntil('\n'); n++; }
+    f.close();
+    return n;
+}
+
+void AttackLog::clearAll() {
+    // Truncate by reopening for write.
+    File f = LittleFS.open(LOG_PATH, "w");
+    if (f) f.close();
+    line_count_ = 0;
+    next_id_ = 1;
+}
+
+void AttackLog::rewriteAll_(const std::vector<AttackEntry>& v) {
+    // recent() returns newest-first; persist oldest-first to keep the file
+    // chronologically ordered.
+    File f = LittleFS.open(LOG_PATH, "w");
+    if (!f) return;
+    for (auto it = v.rbegin(); it != v.rend(); ++it) {
+        JsonDocument d;
+        JsonObject o = d.to<JsonObject>();
+        it->toJson(o);
+        serializeJson(d, f);
+        f.println();
+    }
+    f.close();
+    line_count_ = v.size();
+}
+
+} // namespace honeyopus

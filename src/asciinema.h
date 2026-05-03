@@ -1,0 +1,40 @@
+#pragma once
+
+#include <Arduino.h>
+#include <LittleFS.h>
+
+namespace honeyopus {
+
+// Asciicast v2 writer: https://docs.asciinema.org/manual/asciicast/v2/
+// Header is the first line as a single-line JSON object, then events follow:
+//   [time_offset, "o" | "i", "data"]
+// where data is JSON-string-escaped UTF-8.
+class Asciinema {
+public:
+    bool begin(const String& path,
+               uint16_t cols,
+               uint16_t rows,
+               const String& title,
+               const String& shell_cmd = "/bin/bash");
+    void out(const char* data, size_t len);
+    void in(const char* data, size_t len);
+    void out(const String& s) { out(s.c_str(), s.length()); }
+    void in (const String& s) { in (s.c_str(), s.length()); }
+    void close();
+
+    bool isOpen() const { return f_; }
+    String path() const { return path_; }
+    size_t bytes() const { return bytes_; }
+
+private:
+    void writeEvent_(char kind, const char* data, size_t len);
+    void writeEscaped_(const char* data, size_t len);
+
+    File     f_;
+    String   path_;
+    uint32_t start_us_ = 0;
+    uint32_t last_flush_ms_ = 0;
+    size_t   bytes_ = 0;
+};
+
+} // namespace honeyopus

@@ -1,0 +1,39 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AI / agent scratch
+.claude/
+.copilot/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build output
+build/
+dist/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Local env / secrets
+.env
+.env.local
+secrets.h
+secrets.ini
+*.local.ini
+
+# Web flasher staging (built in CI)
+site/
+docs/_site/

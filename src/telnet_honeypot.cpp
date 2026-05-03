@@ -1,0 +1,328 @@
+#include "telnet_honeypot.h"
+#include "config.h"
+#include "fake_shell.h"
+#include "asciinema.h"
+#include "attack_log.h"
+#include "display.h"
+#include "intel.h"
+#include "attack_classifier.h"
+#include "storage.h"
+
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+#include <time.h>
+
+namespace honeyopus {
+
+static const uint16_t TN_COLS = 80;
+static const uint16_t TN_ROWS = 24;
+static const uint8_t  TN_MAX_CONCURRENT = 3;        // hard cap to keep RAM safe on C3
+
+static AsyncServer*  s_server = nullptr;
+static volatile uint8_t s_active = 0;               // updated on connect/disconnect
+// Worker queue: AsyncTCP callbacks just push the session here, the worker task
+// does the slow LittleFS finalization so the AsyncTCP polling task stays
+// responsive (the previous design starved lwIP and triggered TCP asserts).
+struct TnFinalizeJob { void* sess; };
+static QueueHandle_t s_finalize_q = nullptr;
+
+static String make_session_path(const char* proto) {
+    time_t t = time(nullptr);
+    char buf[64];
+    if (t > 1700000000) {
+        struct tm tm; gmtime_r(&t, &tm);
+        snprintf(buf, sizeof(buf),
+                 "/sessions/%04d%02d%02dT%02d%02d%02d-%s-%lu.cast",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                 tm.tm_hour, tm.tm_min, tm.tm_sec, proto,
+                 (unsigned long)(esp_random() & 0xFFFF));
+    } else {
+        snprintf(buf, sizeof(buf), "/sessions/%010lu-%s.cast",
+                 (unsigned long)millis(), proto);
+    }
+    return String(buf);
+}
+
+// Per-connection session state. Lives on the heap; freed in onDisconnect.
+struct TnSession {
+    AsyncClient* client = nullptr;
+    AttackEntry  entry;
+    Asciinema    cast;
+    FakeShell    shell;
+
+    enum Phase { P_USER, P_PASS, P_SHELL, P_DEAD };
+    Phase    phase = P_USER;
+    String   line_buf;        // accumulating current line
+    String   pending_user;    // captured during P_USER
+    int      attempts = 0;
+    bool     iac_skip = false; // gobbling 1 byte after IAC cmd
+    int      iac_state = 0;    // 0=normal,1=after IAC,2=after IAC+cmd,3=in subneg
+    uint32_t t0 = 0;
+    bool     finalized = false;
+};
+
+// Send `n` bytes, looping over short writes. AsyncTCP's add()/write() may
+// accept fewer bytes than asked when its internal pbuf chain is full; if we
+// don't loop, the tail of any large message (e.g. shell MOTD) is silently lost.
+static void tn_send(TnSession* s, const char* data, size_t n) {
+    if (!s || !s->client || !data || n == 0) return;
+    s->cast.out(data, n);
+    size_t off = 0;
+    uint32_t deadline = millis() + 4000;
+    while (off < n && s->client->connected() && millis() < deadline) {
+        size_t space = s->client->space();
+        if (space == 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+        size_t chunk = (n - off < space) ? n - off : space;
+        size_t added = s->client->add(data + off, chunk, ASYNC_WRITE_FLAG_COPY);
+        if (added == 0) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
+        s->client->send();
+        off += added;
+    }
+}
+
+static void tn_send(TnSession* s, const String& str) {
+    tn_send(s, str.c_str(), str.length());
+}
+
+static void tn_send_iac_neg(TnSession* s) {
+    static const char iac[] = {
+        (char)255, (char)251, (char)1,    // WILL ECHO
+        (char)255, (char)251, (char)3,    // WILL SUPPRESS-GO-AHEAD
+        (char)255, (char)254, (char)34,   // DONT LINEMODE
+    };
+    tn_send(s, iac, sizeof(iac));
+}
+
+static void tn_prompt_login(TnSession* s) {
+    String banner = String(g_config.get().telnet_banner) + "\r\n" +
+                    g_config.get().fake_hostname + " login: ";
+    tn_send(s, banner);
+    s->phase = TnSession::P_USER;
+    s->line_buf = "";
+}
+
+static void tn_prompt_password(TnSession* s) {
+    tn_send(s, "Password: ");
+    s->phase = TnSession::P_PASS;
+    s->line_buf = "";
+}
+
+static void tn_handle_complete_line(TnSession* s) {
+    auto& cfg = g_config.get();
+    String line = s->line_buf;
+    s->line_buf = "";
+
+    if (s->phase == TnSession::P_USER) {
+        s->pending_user = line;
+        tn_prompt_password(s);
+        return;
+    }
+    if (s->phase == TnSession::P_PASS) {
+        s->attempts++;
+        s->entry.user = s->pending_user;
+        s->entry.pass = line;
+        if (s->attempts >= cfg.login_attempts_before_accept) {
+            s->entry.authenticated = true;
+            s->phase = TnSession::P_SHELL;
+            s->shell.begin(s->pending_user.length() ? s->pending_user : String(cfg.fake_user),
+                           cfg.fake_hostname);
+            s->shell.setSessionInfo(s->entry.id, s->entry.ip, s->entry.port,
+                                    "telnet", s->entry.cast_path + ".events.jsonl");
+            tn_send(s, s->shell.motd());
+            tn_send(s, s->shell.prompt());
+        } else {
+            tn_send(s, "\r\nLogin incorrect\r\n");
+            tn_send(s, cfg.fake_hostname + " login: ");
+            s->phase = TnSession::P_USER;
+        }
+        return;
+    }
+    if (s->phase == TnSession::P_SHELL) {
+        String out = s->shell.execute(line);
+        if (out.length()) tn_send(s, out);
+        if (s->shell.exitRequested() || s->shell.sessionLimitsExceeded()) {
+            s->phase = TnSession::P_DEAD;
+            s->client->close();
+            return;
+        }
+        tn_send(s, s->shell.prompt());
+        return;
+    }
+}
+
+static void tn_finalize_inline(TnSession* s) {
+    s->entry.duration_ms = millis() - s->t0;
+    s->entry.commands = s->shell.commandsRun();
+    classify_attack(s->entry, s->shell.commandSummary(), s->shell.firstCmdMs(), s->shell.lastCmdMs());
+    s->cast.close();
+    g_attack_log.append(s->entry);
+    intel_enqueue(s->entry.id);
+    {
+        auto& c = g_config.get();
+        storage_enforce_session_quota(c.max_sessions, (size_t)c.max_session_dir_kb * 1024);
+    }
+    Serial.printf("[telnet] session done id=%u ip=%s user=%s pass=%s authed=%d cmds=%u\n",
+                  (unsigned)s->entry.id, s->entry.ip.c_str(),
+                  s->entry.user.c_str(), s->entry.pass.c_str(),
+                  (int)s->entry.authenticated, s->entry.commands);
+}
+
+static void tn_worker_task(void*) {
+    for (;;) {
+        TnFinalizeJob j;
+        if (xQueueReceive(s_finalize_q, &j, portMAX_DELAY) != pdTRUE) continue;
+        TnSession* s = (TnSession*)j.sess;
+        if (!s) continue;
+        tn_finalize_inline(s);
+        delete s;
+        if (s_active > 0) s_active--;
+    }
+}
+
+static void tn_finalize(TnSession* s) {
+    if (s->finalized) return;
+    s->finalized = true;
+    // Hand the slow FS / intel work off to the worker so we don't block the
+    // AsyncTCP poll task (lwIP gets very upset about that under load).
+    TnFinalizeJob j{ .sess = s };
+    if (s_finalize_q && xQueueSend(s_finalize_q, &j, 0) == pdTRUE) return;
+    // Queue full or not initialized — finalize inline as a fallback.
+    tn_finalize_inline(s);
+    delete s;
+    if (s_active > 0) s_active--;
+}
+
+static void tn_on_data(void* arg, AsyncClient* /*c*/, void* data, size_t len) {
+    auto* s = (TnSession*)arg;
+    if (!s || s->phase == TnSession::P_DEAD) return;
+    const uint8_t* p = (const uint8_t*)data;
+
+    s->cast.in((const char*)p, len);
+
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t ch = p[i];
+
+        // RFC 854 IAC handling.
+        if (s->iac_state == 1) {        // saw IAC; expect cmd
+            if (ch == 250) { s->iac_state = 3; continue; } // SB ... SE
+            if (ch >= 251 && ch <= 254) { s->iac_state = 2; continue; } // WILL/WONT/DO/DONT
+            s->iac_state = 0; continue; // other IAC commands (e.g. NOP, IP) — skip
+        }
+        if (s->iac_state == 2) { s->iac_state = 0; continue; }   // option byte
+        if (s->iac_state == 3) {        // gobble until IAC SE (255 240)
+            if (ch == 240) s->iac_state = 0;
+            continue;
+        }
+        if (ch == 255) { s->iac_state = 1; continue; }
+
+        // Line editing.
+        if (ch == '\r' || ch == '\n') {
+            if (ch == '\r' && i + 1 < len && (p[i+1] == '\n' || p[i+1] == '\0')) i++;
+            tn_send(s, "\r\n", 2);
+            tn_handle_complete_line(s);
+            continue;
+        }
+        if (ch == 0x7f || ch == 0x08) {
+            if (s->line_buf.length()) {
+                s->line_buf.remove(s->line_buf.length() - 1);
+                if (s->phase != TnSession::P_PASS) tn_send(s, "\b \b", 3);
+            }
+            continue;
+        }
+        if (ch == 0x03) { // Ctrl-C
+            tn_send(s, "^C\r\n", 4);
+            s->line_buf = "";
+            if (s->phase == TnSession::P_SHELL) tn_send(s, s->shell.prompt());
+            continue;
+        }
+        if (ch < 0x20) continue;
+        if (s->line_buf.length() > 256) continue;
+        s->line_buf += (char)ch;
+        if (s->phase == TnSession::P_PASS) {
+            tn_send(s, "*", 1);
+        } else {
+            char e = (char)ch;
+            tn_send(s, &e, 1);
+        }
+    }
+}
+
+static void tn_on_disconnect(void* arg, AsyncClient* /*c*/) {
+    auto* s = (TnSession*)arg;
+    if (!s) return;
+    // Note: tn_finalize handles delete (and the active-counter decrement) so
+    // it can be done from the worker task instead of here.
+    tn_finalize(s);
+}
+
+static void tn_on_error(void* arg, AsyncClient* /*c*/, int8_t error) {
+    auto* s = (TnSession*)arg;
+    if (!s) return;
+    Serial.printf("[telnet] error %d on id=%u\n", (int)error, (unsigned)s->entry.id);
+}
+
+static void tn_on_timeout(void* /*arg*/, AsyncClient* c, uint32_t /*time*/) {
+    if (c) c->close();
+}
+
+static void tn_on_client(void* /*arg*/, AsyncClient* c) {
+    if (!c) return;
+    if (!g_config.get().telnet_enabled) { c->close(); return; }
+    if (s_active >= TN_MAX_CONCURRENT) {
+        Serial.printf("[telnet] refusing connection from %s — at cap %u\n",
+                      c->remoteIP().toString().c_str(), (unsigned)TN_MAX_CONCURRENT);
+        c->close();
+        return;
+    }
+    s_active++;
+
+    auto* s = new TnSession();
+    s->client = c;
+    s->t0 = millis();
+    s->entry.id        = g_attack_log.nextId();
+    s->entry.ts        = time(nullptr);
+    s->entry.protocol  = "telnet";
+    s->entry.ip        = c->remoteIP().toString();
+    s->entry.port      = c->remotePort();
+
+    String cast_path   = make_session_path("telnet");
+    s->cast.begin(cast_path, TN_COLS, TN_ROWS,
+                  "Telnet session from " + s->entry.ip,
+                  "/bin/login");
+    s->entry.cast_path = cast_path;
+
+    g_display.showAttack(AttackKind::Telnet);
+
+    c->setNoDelay(true);
+    c->setRxTimeout(120);    // seconds before lwIP gives up if peer goes silent
+    c->setAckTimeout(15000);
+
+    c->onDisconnect(tn_on_disconnect, s);
+    c->onError(tn_on_error, s);
+    c->onTimeout(tn_on_timeout, s);
+    c->onData(tn_on_data, s);
+
+    tn_send_iac_neg(s);
+    tn_prompt_login(s);
+}
+
+void telnet_begin() {
+    if (s_server) return;
+    if (!s_finalize_q) {
+        s_finalize_q = xQueueCreate(8, sizeof(TnFinalizeJob));
+        xTaskCreate(tn_worker_task, "tn_fin", 6144, nullptr, 1, nullptr);
+    }
+    s_server = new AsyncServer(HONEYOPUS_TELNET_PORT);
+    s_server->onClient(tn_on_client, nullptr);
+    s_server->begin();
+    Serial.printf("[telnet] AsyncTCP listener on port %u (max %u concurrent)\n",
+                  (unsigned)HONEYOPUS_TELNET_PORT, (unsigned)TN_MAX_CONCURRENT);
+}
+
+} // namespace honeyopus
