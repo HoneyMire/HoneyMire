@@ -30,6 +30,31 @@ static volatile uint8_t s_active = 0;               // updated on connect/discon
 struct TnFinalizeJob { void* sess; };
 static QueueHandle_t s_finalize_q = nullptr;
 
+// Live-session registry. AsyncTCP's per-client onPoll / onDisconnect
+// callbacks are not always invoked when lwIP tears a pcb down under
+// memory pressure; we observed a session admitted at boot and then
+// pinned for >4 minutes with neither callback ever firing. The reaper
+// (telnet_reap) walks this registry from the main loop and force-closes
+// anything past the wall-clock cap, independent of AsyncTCP behavior.
+struct TnSession;
+static portMUX_TYPE  s_reg_mux = portMUX_INITIALIZER_UNLOCKED;
+static TnSession*    s_registry[TN_MAX_CONCURRENT] = {nullptr, nullptr, nullptr};
+
+static void registry_add(TnSession* s) {
+    portENTER_CRITICAL(&s_reg_mux);
+    for (auto& slot : s_registry) {
+        if (slot == nullptr) { slot = s; break; }
+    }
+    portEXIT_CRITICAL(&s_reg_mux);
+}
+static void registry_remove(TnSession* s) {
+    portENTER_CRITICAL(&s_reg_mux);
+    for (auto& slot : s_registry) {
+        if (slot == s) { slot = nullptr; break; }
+    }
+    portEXIT_CRITICAL(&s_reg_mux);
+}
+
 static String make_session_path(const char* proto) {
     time_t t = time(nullptr);
     char buf[64];
@@ -190,6 +215,7 @@ static void tn_worker_task(void*) {
 static void tn_finalize(TnSession* s) {
     if (s->finalized) return;
     s->finalized = true;
+    registry_remove(s);
     // Detach AsyncTCP callbacks so any further events on this client (e.g.
     // onDisconnect arriving after onError finalized us) won't deref a freed
     // TnSession. We pass nullptr both as cb and arg.
@@ -327,6 +353,7 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     auto* s = new TnSession();
     s->client = c;
     s->t0 = millis();
+    registry_add(s);
     s->entry.id        = g_attack_log.nextId();
     s->entry.ts        = time(nullptr);
     s->entry.protocol  = "telnet";
@@ -366,6 +393,27 @@ void telnet_begin() {
     s_server->begin();
     Serial.printf("[telnet] AsyncTCP listener on port %u (max %u concurrent)\n",
                   (unsigned)HONEYOPUS_TELNET_PORT, (unsigned)TN_MAX_CONCURRENT);
+}
+
+void telnet_reap() {
+    constexpr uint32_t kTnMaxSessionMs = 15000;
+    uint32_t now = millis();
+    TnSession* victims[TN_MAX_CONCURRENT] = {nullptr, nullptr, nullptr};
+    size_t n = 0;
+    portENTER_CRITICAL(&s_reg_mux);
+    for (auto& slot : s_registry) {
+        if (slot && !slot->finalized && (now - slot->t0) > kTnMaxSessionMs) {
+            victims[n++] = slot;
+        }
+    }
+    portEXIT_CRITICAL(&s_reg_mux);
+    for (size_t i = 0; i < n; ++i) {
+        TnSession* s = victims[i];
+        Serial.printf("[telnet] reaper closed session id=%u age=%ums\n",
+                      (unsigned)s->entry.id, (unsigned)(now - s->t0));
+        if (s->client) s->client->close(true);
+        tn_finalize(s);
+    }
 }
 
 } // namespace honeyopus

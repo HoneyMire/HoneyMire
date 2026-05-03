@@ -120,6 +120,13 @@ void loop() {
     // browser tab is stale".
     static uint32_t last_health = 0;
     uint32_t now = millis();
+
+    static uint32_t last_reap = 0;
+    if (now - last_reap > 1000) {
+        last_reap = now;
+        telnet_reap();
+    }
+
     if (now - last_health > 30000) {
         last_health = now;
         const char* mode = "?";
