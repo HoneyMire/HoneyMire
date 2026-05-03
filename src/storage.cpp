@@ -1,4 +1,5 @@
 #include "storage.h"
+#include "config.h"
 
 #include <algorithm>
 #include <sys/stat.h>

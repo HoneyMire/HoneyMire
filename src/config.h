@@ -3,6 +3,23 @@
 #include <Arduino.h>
 #include <Preferences.h>
 
+// On the bare ESP32-S3 N16R8 dev board, the visible USB jack is wired
+// to a CH340/CP2102 USB-UART chip on UART0 — NOT the S3's native USB
+// pins. Our shared build_flags enable ARDUINO_USB_CDC_ON_BOOT, which
+// makes `Serial` the native USB-CDC instance. That instance enumerates
+// fine but its output never reaches the CH340, so the monitor stays
+// silent forever even though the firmware is running. Redirect every
+// `Serial.print` in our own translation units to UART0 (`Serial0`).
+// Framework .cpp files have already #included HardwareSerial.h before
+// this header is reached, so this define only rewrites references in
+// our code — no clash with the framework's own `extern Serial0`.
+#if defined(HONEYOPUS_BOARD_KIND_S3_N16R8) && !defined(HONEYOPUS_NO_SERIAL_REMAP)
+#  ifdef Serial
+#    undef Serial
+#  endif
+#  define Serial Serial0
+#endif
+
 namespace honeyopus {
 
 #ifndef HONEYOPUS_BOARD_NAME
