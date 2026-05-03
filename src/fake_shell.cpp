@@ -831,6 +831,8 @@ String FakeShell::runOne_(Cmd& c) {
     if (e=="history") return cmdHistory_(c);
     if (e=="wget") return cmdWget_(c);
     if (e=="curl") return cmdCurl_(c);
+    if (e=="tftp") return cmdTftp_(c);
+    if (e=="ftpget"||e=="tftpget") return cmdFtpget_(c);
     if (e=="chmod") return cmdChmod_(c);
     if (e=="chown"||e=="chgrp") return cmdChown_(c);
     if (e=="rm") return cmdRm_(c);
@@ -1696,6 +1698,108 @@ String FakeShell::cmdCurl_(Cmd& c) {
     return "";
 }
 
+// ----- tftp / ftpget / nc (Mirai/Gafgyt downloader fallbacks) -----
+//
+// Real Mirai stagers loop over wget → curl → tftp → ftpget → echo-bytes.
+// On a real busy box-Linux all of these silently succeed; emulating that
+// keeps the bot's flow advancing past `chmod 777 X` and `./X` so we can
+// log the full payload-execution sequence. Output mimics the real tools'
+// behavior on success (silent) and only complains when the caller passed
+// no arguments at all.
+
+String FakeShell::cmdTftp_(Cmd& c) {
+    // Common attacker syntaxes:
+    //   tftp HOST -c get FILE
+    //   tftp -g -r FILE HOST              (busybox tftp)
+    //   tftp -i HOST GET FILE FILE
+    String host, file;
+    for (size_t i = 1; i < c.argv.size(); ++i) {
+        const String& a = c.argv[i];
+        if (a == "-c" || a == "-i" || a == "-g" || a == "-p" || a == "-v") continue;
+        if (a == "-r" || a == "-l") {
+            if (i + 1 < c.argv.size()) { file = c.argv[i + 1]; ++i; }
+            continue;
+        }
+        if (a.equalsIgnoreCase("get") || a.equalsIgnoreCase("put") ||
+            a.equalsIgnoreCase("GET") || a.equalsIgnoreCase("PUT")) continue;
+        if (a.startsWith("-")) continue;
+        // First non-flag token that looks like a host (has a dot, no slash)
+        // is the server; the remaining one is the filename.
+        if (!host.length() && a.indexOf('/') < 0 && a.indexOf('.') >= 0) { host = a; continue; }
+        if (!file.length()) { file = a; continue; }
+    }
+    if (!host.length() && !file.length()) {
+        last_status_ok_ = false;
+        return "tftp: usage: tftp [-i] HOST [GET|PUT] SRC [DST]\n";
+    }
+    if (!file.length()) file = "tftp.bin";
+    String dst = file.startsWith("/") ? file : (cwd_ + "/" + file);
+    String abs = resolvePath_(dst);
+    String dir = abs.substring(0, abs.lastIndexOf('/') + 1);
+    if (!isWritableDir_(dir)) abs = "/tmp/" + basename_(file);
+    String url = "tftp://" + host + "/" + basename_(file);
+    VirtualFile* vf = createFile_(abs, "tftp");
+    String arch = guessArch_(url + " " + file);
+    String prof = guessProfile_(url, file);
+    if (vf) {
+        vf->source_url = url;
+        vf->arch = arch;
+        vf->payload_profile = prof;
+        vf->size = 8192 + (millis() & 0xfff);
+        vf->mode = 0644;
+        vf->mtime_ms = millis();
+    }
+    StaticJsonDocument<384> d;
+    d["url"] = url; d["file"] = abs; d["tool"] = "tftp";
+    d["arch"] = arch; d["profile"] = prof;
+    String body; serializeJson(d, body);
+    logEvent_("download_url", body);
+    return "";  // real tftp client is silent on success
+}
+
+String FakeShell::cmdFtpget_(Cmd& c) {
+    // busybox ftpget [-cvi] [-u USER] [-p PASS] [-P PORT] HOST LOCAL [REMOTE]
+    String host, local, remote;
+    for (size_t i = 1; i < c.argv.size(); ++i) {
+        const String& a = c.argv[i];
+        if (a == "-u" || a == "-p" || a == "-P") {
+            if (i + 1 < c.argv.size()) ++i;
+            continue;
+        }
+        if (a.startsWith("-")) continue;
+        if (!host.length()) { host = a; continue; }
+        if (!local.length()) { local = a; continue; }
+        if (!remote.length()) { remote = a; continue; }
+    }
+    if (!host.length() || !local.length()) {
+        last_status_ok_ = false;
+        return "ftpget: usage: ftpget [-cvi] [-u USER] [-p PASS] HOST LOCAL [REMOTE]\n";
+    }
+    if (!remote.length()) remote = local;
+    String dst = local.startsWith("/") ? local : (cwd_ + "/" + local);
+    String abs = resolvePath_(dst);
+    String dir = abs.substring(0, abs.lastIndexOf('/') + 1);
+    if (!isWritableDir_(dir)) abs = "/tmp/" + basename_(local);
+    String url = "ftp://" + host + "/" + remote;
+    VirtualFile* vf = createFile_(abs, "ftpget");
+    String arch = guessArch_(url + " " + local);
+    String prof = guessProfile_(url, local);
+    if (vf) {
+        vf->source_url = url;
+        vf->arch = arch;
+        vf->payload_profile = prof;
+        vf->size = 8192 + (millis() & 0xfff);
+        vf->mode = 0644;
+        vf->mtime_ms = millis();
+    }
+    StaticJsonDocument<384> d;
+    d["url"] = url; d["file"] = abs; d["tool"] = "ftpget";
+    d["arch"] = arch; d["profile"] = prof;
+    String body; serializeJson(d, body);
+    logEvent_("download_url", body);
+    return "";
+}
+
 // ----- chmod/chown/rm/mkdir/touch/mv/cp -----
 
 String FakeShell::cmdChmod_(Cmd& c) {
@@ -1774,7 +1878,7 @@ String FakeShell::cmdWhich_(Cmd& c) {
             r += "/bin/"+n+"\n";
         else if (n=="wget"||n=="curl"||n=="python"||n=="python3"||n=="perl"||n=="php"||
                  n=="nc"||n=="ncat"||n=="ifconfig"||n=="ip"||n=="ss"||n=="netstat"||
-                 n=="apt"||n=="apt-get"||n=="dpkg")
+                 n=="apt"||n=="apt-get"||n=="dpkg"||n=="tftp"||n=="ftpget"||n=="tftpget")
             r += "/usr/bin/"+n+"\n";
         else { last_status_ok_=false; }
     }

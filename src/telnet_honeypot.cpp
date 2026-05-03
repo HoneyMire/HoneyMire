@@ -407,17 +407,22 @@ void telnet_reap() {
         }
     }
     portEXIT_CRITICAL(&s_reg_mux);
-    // Important: do NOT call tn_finalize from the reaper. The worker task
-    // owns the lifetime of TnSession*, and AsyncTCP still holds a pointer
-    // to it as the callback `arg`. Deleting s here would cause a UAF when
-    // AsyncTCP later fires onDisconnect. A graceful close() is enough —
-    // AsyncTCP will fire onDisconnect, which goes through the normal path.
-    // We also do NOT touch any AsyncTCP setter API (which would deadlock
-    // with a Serial-blocked AsyncTCP task).
+    // Reaper used to call victims[i]->close() from main loop, but doing so
+    // while lwIP is concurrently processing an ACK/packet on the same pcb
+    // can trigger the lwIP assertion
+    //   tcp_update_rcv_ann_wnd: new_rcv_ann_wnd <= 0xffff
+    // — the receive-window update races against tcp_close()/tcp_recved()
+    // and overflows. Calling AsyncClient::close() from a task other than
+    // the AsyncTCP/lwIP task is simply not safe under load.
+    //
+    // We accept the trade-off: a session whose poll callback stops firing
+    // stays in the registry until reboot. With max 3 concurrent slots and
+    // the 5 min IP cooldown gate, leakage is bounded. The heap watchdog
+    // will reboot the device if it ever matters.
     for (size_t i = 0; i < n; ++i) {
         if (victims[i]) {
-            Serial.printf("[telnet] reaper closing session id=%u\n", (unsigned)vids[i]);
-            victims[i]->close();
+            Serial.printf("[telnet] reaper: session id=%u stuck (>%us), leaking until reboot\n",
+                          (unsigned)vids[i], (unsigned)(kTnMaxSessionMs / 1000));
         }
     }
 }
