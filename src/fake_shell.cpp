@@ -103,6 +103,117 @@ static const char* FAKE_UNAME_A =
 
 static const char* FAKE_UPTIME_PROC = "1234567.89 1234000.00\n";
 
+static const char* FAKE_LOADAVG_PROC = "0.08 0.12 0.09 1/142 12345\n";
+
+static const char* FAKE_FILESYSTEMS_PROC =
+    "nodev\tsysfs\n"
+    "nodev\trootfs\n"
+    "nodev\tramfs\n"
+    "nodev\tbdev\n"
+    "nodev\tproc\n"
+    "nodev\tcgroup\n"
+    "nodev\tcgroup2\n"
+    "nodev\tcpuset\n"
+    "nodev\ttmpfs\n"
+    "nodev\tdevtmpfs\n"
+    "nodev\tdebugfs\n"
+    "nodev\ttracefs\n"
+    "nodev\tsecurityfs\n"
+    "nodev\tsockfs\n"
+    "nodev\tpipefs\n"
+    "nodev\tdevpts\n"
+    "\text4\n"
+    "\text3\n"
+    "\text2\n"
+    "nodev\thugetlbfs\n"
+    "nodev\tautofs\n"
+    "nodev\tmqueue\n";
+
+static const char* FAKE_MODULES_PROC =
+    "nf_conntrack_ipv4 16384 4 - Live 0xffffffffc04d2000\n"
+    "nf_defrag_ipv4 16384 1 nf_conntrack_ipv4, Live 0xffffffffc04c5000\n"
+    "xt_conntrack 16384 14 - Live 0xffffffffc04ba000\n"
+    "ip_tables 28672 2 iptable_filter,iptable_nat, Live 0xffffffffc049d000\n"
+    "x_tables 40960 9 xt_conntrack,iptable_filter,ip_tables, Live 0xffffffffc0488000\n"
+    "virtio_net 28672 0 - Live 0xffffffffc045d000\n"
+    "virtio_blk 20480 3 - Live 0xffffffffc0451000\n";
+
+static const char* FAKE_NET_ROUTE_PROC =
+    "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+    "eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+    "eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+
+static const char* FAKE_NET_TCP_PROC =
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+    "   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0\n"
+    "   1: 0100007F:0019 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12346 1 0000000000000000 100 0 0 10 0\n"
+    "   2: 0101A8C0:0016 0201A8C0:E132 01 00000000:00000000 02:000005A4 00000000     0        0 23456 2 0000000000000000 20 4 30 10 -1\n";
+
+static const char* FAKE_NET_UDP_PROC =
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
+    "   0: 00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 11111 2 0000000000000000 0\n"
+    "   1: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 11112 2 0000000000000000 0\n";
+
+static const char* FAKE_NET_DEV_PROC =
+    "Inter-|   Receive                                                |  Transmit\n"
+    " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
+    "    lo: 1842413    14523    0    0    0     0          0         0  1842413   14523    0    0    0     0       0          0\n"
+    "  eth0: 543219874  812349    0    0    0     0          0       412 421987432  612893    0    0    0     0       0          0\n";
+
+static const char* FAKE_NET_ARP_PROC =
+    "IP address       HW type     Flags       HW address            Mask     Device\n"
+    "192.168.1.1      0x1         0x2         52:54:00:12:34:56     *        eth0\n";
+
+static const char* FAKE_STAT_PROC =
+    "cpu  4523 0 1842 1234567 412 0 89 0 0 0\n"
+    "cpu0 4523 0 1842 1234567 412 0 89 0 0 0\n"
+    "intr 8123456 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+    "ctxt 12345678\n"
+    "btime 1685000000\n"
+    "processes 12345\n"
+    "procs_running 1\n"
+    "procs_blocked 0\n"
+    "softirq 1234567 0 412345 89 234567 0 0 12345 234567 0 340654\n";
+
+static const char* FAKE_CGROUP_PROC =
+    "12:freezer:/\n"
+    "11:net_cls,net_prio:/\n"
+    "10:cpu,cpuacct:/\n"
+    "9:pids:/\n"
+    "8:devices:/\n"
+    "7:memory:/\n"
+    "6:perf_event:/\n"
+    "5:hugetlb:/\n"
+    "4:blkio:/\n"
+    "3:rdma:/\n"
+    "2:misc:/\n"
+    "1:name=systemd:/\n"
+    "0::/\n";
+
+// PID assigned to the current shell ("self"). Matches the entry pushed in
+// begin() (pts/0 -bash). Bots that probe /proc/self/* should see consistent
+// content tied to this pid.
+static const uint16_t kSelfPid = 999;
+
+// If `abs` is /proc/self/X or /proc/self return ("self", X). If it is
+// /proc/<digits>/X or /proc/<digits> return (pid_string, X). Otherwise
+// return ("", "") — caller should fall through.
+static bool parseProcPid_(const String& abs, String& pid_out, String& tail_out) {
+    if (!abs.startsWith("/proc/")) return false;
+    int slash = abs.indexOf('/', 6);
+    String first = (slash < 0) ? abs.substring(6) : abs.substring(6, slash);
+    if (first == "self") {
+        pid_out = "self";
+    } else {
+        if (first.length() == 0) return false;
+        for (size_t i = 0; i < first.length(); ++i)
+            if (!isdigit((unsigned char)first[i])) return false;
+        pid_out = first;
+    }
+    tail_out = (slash < 0) ? String() : abs.substring(slash + 1);
+    return true;
+}
+
 // ----- helpers -----
 static String trim(const String& s) {
     int a=0,b=s.length();
@@ -386,7 +497,34 @@ bool FakeShell::fileExists_(const String& abs) const {
     if (abs=="/etc/passwd"||abs=="/etc/shadow"||abs=="/etc/os-release"||
         abs=="/etc/issue"||abs=="/etc/hostname"||abs=="/etc/hosts"||
         abs=="/etc/resolv.conf"||abs=="/proc/cpuinfo"||abs=="/proc/meminfo"||
-        abs=="/proc/mounts"||abs=="/proc/version"||abs=="/proc/uptime") return true;
+        abs=="/proc/mounts"||abs=="/proc/version"||abs=="/proc/uptime"||
+        abs=="/proc/loadavg"||abs=="/proc/stat"||abs=="/proc/filesystems"||
+        abs=="/proc/modules"||abs=="/proc/cmdline"||
+        abs=="/proc/net/route"||abs=="/proc/net/tcp"||abs=="/proc/net/tcp6"||
+        abs=="/proc/net/udp"||abs=="/proc/net/udp6"||abs=="/proc/net/dev"||
+        abs=="/proc/net/arp"||abs=="/proc/net/unix"||
+        abs=="/proc/sys/kernel/hostname"||abs=="/proc/sys/kernel/osrelease"||
+        abs=="/proc/sys/kernel/ostype"||abs=="/proc/sys/kernel/version"||
+        abs=="/proc/sys/kernel/random/boot_id"||abs=="/proc/sys/kernel/random/uuid")
+        return true;
+    // Per-pid synthetic files: /proc/self/<x> or /proc/<existing-pid>/<x>
+    {
+        String pid_str, tail;
+        if (parseProcPid_(abs, pid_str, tail) && tail.length()) {
+            bool pid_known = (pid_str == "self");
+            if (!pid_known) {
+                uint16_t p = (uint16_t)toLongOr(pid_str, 0);
+                for (auto& fp : procs_) if (fp.pid == p) { pid_known = true; break; }
+            }
+            if (pid_known) {
+                static const char* leaves[] = {
+                    "cmdline","comm","status","stat","statm","environ","loginuid",
+                    "sessionid","oom_score","oom_score_adj","io","limits","cgroup",
+                    "maps","mounts","mountinfo","exe","cwd","root", nullptr };
+                for (int i = 0; leaves[i]; ++i) if (tail == leaves[i]) return true;
+            }
+        }
+    }
     return false;
 }
 bool FakeShell::isDir_(const String& abs) const {
@@ -394,9 +532,20 @@ bool FakeShell::isDir_(const String& abs) const {
     if (f) return f->is_dir;
     if (abs=="/"||abs=="/tmp"||abs=="/var"||abs=="/var/tmp"||abs=="/var/log"||
         abs=="/var/run"||abs=="/etc"||abs=="/root"||abs=="/home"||abs=="/dev"||
-        abs=="/dev/shm"||abs=="/proc"||abs=="/sys"||abs=="/usr"||abs=="/usr/bin"||
+        abs=="/dev/shm"||abs=="/proc"||abs=="/proc/net"||abs=="/proc/sys"||
+        abs=="/proc/sys/kernel"||abs=="/proc/sys/kernel/random"||
+        abs=="/sys"||abs=="/usr"||abs=="/usr/bin"||
         abs=="/usr/sbin"||abs=="/usr/local"||abs=="/bin"||abs=="/sbin"||abs=="/lib"||
         abs=="/opt"||abs=="/mnt"||abs.startsWith("/home/")) return true;
+    // /proc/self and /proc/<pid> directories
+    {
+        String pid_str, tail;
+        if (parseProcPid_(abs, pid_str, tail) && tail.length() == 0) {
+            if (pid_str == "self") return true;
+            uint16_t p = (uint16_t)toLongOr(pid_str, 0);
+            for (auto& fp : procs_) if (fp.pid == p) return true;
+        }
+    }
     // Common home subdirs
     if (abs=="/root/.ssh"||abs=="/root/.cache") return true;
     if (abs.startsWith("/home/") &&
@@ -795,6 +944,43 @@ String FakeShell::cmdLs_(Cmd& c) {
     } else if (dir == "/etc") {
         const char* es[]={"passwd","shadow","hostname","hosts","resolv.conf","os-release","issue","crontab","cron.d","cron.hourly","cron.daily","ssh","systemd","apt",nullptr};
         for (int j=0;es[j];++j) emit(es[j], (j>=8), j<8?(uint32_t)512:4096);
+    } else if (dir == "/proc") {
+        // Numeric pid dirs first (sorted by insertion order — good enough),
+        // then the standard top-level pseudo-files real /proc exposes.
+        for (auto& p : procs_) {
+            emit(String(p.pid).c_str(), true, 0);
+        }
+        emit("self", true, 0);
+        emit("thread-self", true, 0);
+        const char* pf[]={"cpuinfo","meminfo","mounts","uptime","loadavg","stat",
+            "version","cmdline","filesystems","modules","cgroups","crypto",
+            "devices","diskstats","interrupts","kallsyms","keys","kmsg",
+            "misc","partitions","sched_debug","slabinfo","softirqs","swaps",
+            "sysrq-trigger","timer_list","vmallocinfo","vmstat","zoneinfo",
+            "net","sys","tty","bus","driver","fs","irq","scsi", nullptr};
+        for (int j=0;pf[j];++j) {
+            bool d = (String(pf[j])=="net" || String(pf[j])=="sys" ||
+                      String(pf[j])=="tty" || String(pf[j])=="bus" ||
+                      String(pf[j])=="driver"||String(pf[j])=="fs" ||
+                      String(pf[j])=="irq" || String(pf[j])=="scsi");
+            emit(pf[j], d, d ? 0 : 0);
+        }
+    } else if (dir.startsWith("/proc/")) {
+        // /proc/<pid> or /proc/self
+        String pid_str, tail;
+        if (parseProcPid_(dir, pid_str, tail) && tail.length() == 0) {
+            const char* leaves[] = {
+                "cmdline","comm","cwd","environ","exe","fd","io","limits",
+                "loginuid","maps","mem","mountinfo","mounts","mountstats",
+                "net","ns","oom_score","oom_score_adj","pagemap","personality",
+                "root","sched","sessionid","setgroups","smaps","stack","stat",
+                "statm","status","syscall","task","timers","wchan", nullptr };
+            for (int j=0;leaves[j];++j) {
+                bool d = (String(leaves[j])=="fd" || String(leaves[j])=="net" ||
+                          String(leaves[j])=="ns" || String(leaves[j])=="task");
+                emit(leaves[j], d, 0);
+            }
+        }
     } else if (dir == "/tmp" || dir == "/var/tmp" || dir == "/dev/shm") {
         if (all) { emit(".", true, 4096); emit("..", true, 4096); }
     } else if (!isDir_(dir)) {
@@ -834,6 +1020,225 @@ String FakeShell::cmdCd_(Cmd& c) {
 
 String FakeShell::passwdFile_() const { return FAKE_PASSWD; }
 
+bool FakeShell::procVirtualFile_(const String& abs, const Cmd& caller, String& out) const {
+    // Top-level /proc/* files first.
+    if (abs == "/proc/cpuinfo")     { out += FAKE_CPUINFO; return true; }
+    if (abs == "/proc/meminfo")     { out += FAKE_MEMINFO; return true; }
+    if (abs == "/proc/mounts")      { out += FAKE_MOUNTS_PROC; return true; }
+    if (abs == "/proc/uptime")      { out += FAKE_UPTIME_PROC; return true; }
+    if (abs == "/proc/loadavg")     { out += FAKE_LOADAVG_PROC; return true; }
+    if (abs == "/proc/stat")        { out += FAKE_STAT_PROC; return true; }
+    if (abs == "/proc/filesystems") { out += FAKE_FILESYSTEMS_PROC; return true; }
+    if (abs == "/proc/modules")     { out += FAKE_MODULES_PROC; return true; }
+    if (abs == "/proc/cmdline")     { out += "BOOT_IMAGE=/boot/vmlinuz-4.15.0-142-generic root=UUID=01234567-89ab-cdef-0123-456789abcdef ro quiet splash\n"; return true; }
+    if (abs == "/proc/version")     { out += "Linux version 4.15.0-142-generic (buildd@lcy01-amd64-006) (gcc version 7.5.0 (Ubuntu 7.5.0-3ubuntu1~18.04)) #146-Ubuntu SMP Tue Apr 13 01:11:19 UTC 2021\n"; return true; }
+    if (abs == "/proc/net/route")   { out += FAKE_NET_ROUTE_PROC; return true; }
+    if (abs == "/proc/net/tcp")     { out += FAKE_NET_TCP_PROC; return true; }
+    if (abs == "/proc/net/tcp6")    { out += "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"; return true; }
+    if (abs == "/proc/net/udp")     { out += FAKE_NET_UDP_PROC; return true; }
+    if (abs == "/proc/net/udp6")    { out += "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"; return true; }
+    if (abs == "/proc/net/dev")     { out += FAKE_NET_DEV_PROC; return true; }
+    if (abs == "/proc/net/arp")     { out += FAKE_NET_ARP_PROC; return true; }
+    if (abs == "/proc/net/unix")    { out += "Num       RefCount Protocol Flags    Type St Inode Path\n0000000000000000: 00000002 00000000 00010000 0001 01 12345 /run/systemd/private\n"; return true; }
+    if (abs == "/proc/sys/kernel/hostname")  { out += host_; out += "\n"; return true; }
+    if (abs == "/proc/sys/kernel/osrelease") { out += "4.15.0-142-generic\n"; return true; }
+    if (abs == "/proc/sys/kernel/ostype")    { out += "Linux\n"; return true; }
+    if (abs == "/proc/sys/kernel/version")   { out += "#146-Ubuntu SMP Tue Apr 13 01:11:19 UTC 2021\n"; return true; }
+    if (abs == "/proc/sys/kernel/random/boot_id") { out += "0a1b2c3d-4e5f-6789-abcd-ef0123456789\n"; return true; }
+    if (abs == "/proc/sys/kernel/random/uuid")    { out += "deadbeef-1234-5678-9abc-def012345678\n"; return true; }
+
+    // Per-pid files: /proc/self/* or /proc/<pid>/*
+    String pid_str, tail;
+    if (!parseProcPid_(abs, pid_str, tail)) return false;
+
+    // Resolve "self" to the current shell pid; build a synthetic FakeProcess
+    // for the caller when emitting cmdline/comm/stat for /proc/self/* so the
+    // attacker sees the actual command they just ran.
+    bool is_self = (pid_str == "self");
+    uint16_t pid = is_self ? kSelfPid : (uint16_t)toLongOr(pid_str, 0);
+    if (pid == 0) return false;
+
+    // Lookup process record.
+    const FakeProcess* proc = nullptr;
+    for (auto& p : procs_) if (p.pid == pid) { proc = &p; break; }
+
+    // For /proc/self/* the "running process" is the cat/head/tail command
+    // itself, not the parent shell. Synthesize a matching FakeProcess so
+    // cmdline/comm/exe reflect the caller exactly (this is how a real
+    // kernel resolves /proc/self at open(2) time).
+    FakeProcess synth;
+    if (is_self) {
+        synth.pid  = kSelfPid;
+        synth.user = user_;
+        synth.tty  = "pts/0";
+        // Reconstruct argv with spaces; cmdline emitter splits back to NULs.
+        synth.cmd = caller.exe.length() ? caller.exe : caller.argv[0];
+        for (size_t i = 1; i < caller.argv.size(); ++i) {
+            synth.cmd += ' ';
+            synth.cmd += caller.argv[i];
+        }
+        proc = &synth;
+    }
+    if (!proc) {
+        // Unknown pid — same ENOENT path as a real kernel.
+        return false;
+    }
+
+    if (tail == "" || tail == "/") {
+        // Cat-ing the directory itself: real kernel returns EISDIR. Caller
+        // will fall through to "Is a directory" message. Returning false
+        // is fine; isDir_ also recognizes /proc/<pid> as a directory.
+        return false;
+    }
+
+    if (tail == "cmdline") {
+        // NUL-separated argv with trailing NUL, no newline. Terminals don't
+        // render NUL so to the human eye they look concatenated; this is
+        // exactly what a real Linux box prints.
+        String c = proc->cmd;
+        for (size_t i = 0; i < c.length(); ++i) {
+            if (c[i] == ' ') out += '\0';
+            else out += c[i];
+        }
+        out += '\0';
+        return true;
+    }
+    if (tail == "comm") {
+        // basename of argv[0], stripping any leading '-' (login shells).
+        String c = proc->cmd;
+        int sp = c.indexOf(' ');
+        if (sp > 0) c = c.substring(0, sp);
+        if (c.startsWith("-")) c = c.substring(1);
+        int sl = c.lastIndexOf('/');
+        if (sl >= 0) c = c.substring(sl + 1);
+        out += c;
+        out += '\n';
+        return true;
+    }
+    if (tail == "status") {
+        String comm; { Cmd cc; cc.argv.push_back("comm"); String t; procVirtualFile_("/proc/" + pid_str + "/comm", cc, t); comm = trim(t); }
+        out += "Name:\t"; out += comm; out += "\n";
+        out += "Umask:\t0022\n";
+        out += "State:\tS (sleeping)\n";
+        out += "Tgid:\t"; out += String(pid); out += "\n";
+        out += "Ngid:\t0\n";
+        out += "Pid:\t"; out += String(pid); out += "\n";
+        out += "PPid:\t1\n";
+        out += "TracerPid:\t0\n";
+        out += "Uid:\t0\t0\t0\t0\n";
+        out += "Gid:\t0\t0\t0\t0\n";
+        out += "FDSize:\t64\n";
+        out += "Groups:\t\n";
+        out += "VmPeak:\t   "; out += String(proc->vsz); out += " kB\n";
+        out += "VmSize:\t   "; out += String(proc->vsz); out += " kB\n";
+        out += "VmRSS:\t   ";  out += String(proc->rss); out += " kB\n";
+        out += "Threads:\t1\n";
+        out += "SigQ:\t0/3795\n";
+        out += "SigPnd:\t0000000000000000\n";
+        out += "ShdPnd:\t0000000000000000\n";
+        out += "SigBlk:\t0000000000010000\n";
+        out += "SigIgn:\t0000000000384004\n";
+        out += "SigCgt:\t000000004b817efb\n";
+        out += "CapInh:\t0000000000000000\n";
+        out += "CapPrm:\t0000003fffffffff\n";
+        out += "CapEff:\t0000003fffffffff\n";
+        out += "CapBnd:\t0000003fffffffff\n";
+        out += "CapAmb:\t0000000000000000\n";
+        out += "Cpus_allowed:\t1\n";
+        out += "Cpus_allowed_list:\t0\n";
+        out += "Mems_allowed:\t00000000,00000001\n";
+        out += "Mems_allowed_list:\t0\n";
+        out += "voluntary_ctxt_switches:\t42\n";
+        out += "nonvoluntary_ctxt_switches:\t8\n";
+        return true;
+    }
+    if (tail == "stat") {
+        String comm; { Cmd cc; cc.argv.push_back("comm"); String t; procVirtualFile_("/proc/" + pid_str + "/comm", cc, t); comm = trim(t); }
+        // Minimal /proc/<pid>/stat: 52 fields. Most bots only parse the
+        // first few (pid, comm, state, ppid).
+        out += String(pid); out += " (";
+        out += comm; out += ") S 1 ";
+        out += String(pid); out += " "; out += String(pid); out += " 34816 ";
+        out += String(pid); out += " 4194304 142 0 0 0 1 0 0 0 20 0 1 0 1234 ";
+        out += String(proc->vsz * 1024UL); out += " "; out += String(proc->rss); out += " 18446744073709551615 ";
+        out += "94000000000000 94000000010000 140700000000 0 0 0 0 65536 1 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+        return true;
+    }
+    if (tail == "statm") {
+        out += String(proc->vsz / 4); out += " ";
+        out += String(proc->rss / 4); out += " 256 32 0 128 0\n";
+        return true;
+    }
+    if (tail == "environ") {
+        // NUL-separated KEY=VAL pairs.
+        for (auto& kv : env_) {
+            out += kv.first; out += '='; out += kv.second; out += '\0';
+        }
+        return true;
+    }
+    if (tail == "loginuid") { out += "0"; return true; }
+    if (tail == "sessionid") { out += "1\n"; return true; }
+    if (tail == "oom_score") { out += "0\n"; return true; }
+    if (tail == "oom_score_adj") { out += "0\n"; return true; }
+    if (tail == "io") {
+        out += "rchar: 1024\nwchar: 512\nsyscr: 8\nsyscw: 4\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n";
+        return true;
+    }
+    if (tail == "limits") {
+        out += "Limit                     Soft Limit           Hard Limit           Units     \n"
+               "Max cpu time              unlimited            unlimited            seconds   \n"
+               "Max file size             unlimited            unlimited            bytes     \n"
+               "Max data size             unlimited            unlimited            bytes     \n"
+               "Max stack size            8388608              unlimited            bytes     \n"
+               "Max core file size        0                    unlimited            bytes     \n"
+               "Max resident set          unlimited            unlimited            bytes     \n"
+               "Max processes             3795                 3795                 processes \n"
+               "Max open files            1024                 4096                 files     \n"
+               "Max locked memory         16777216             16777216             bytes     \n"
+               "Max address space         unlimited            unlimited            bytes     \n"
+               "Max file locks            unlimited            unlimited            locks     \n"
+               "Max pending signals       3795                 3795                 signals   \n"
+               "Max msgqueue size         819200               819200               bytes     \n"
+               "Max nice priority         0                    0                    \n"
+               "Max realtime priority     0                    0                    \n"
+               "Max realtime timeout      unlimited            unlimited            us        \n";
+        return true;
+    }
+    if (tail == "cgroup") { out += FAKE_CGROUP_PROC; return true; }
+    if (tail == "maps") {
+        // Trimmed maps for a typical small static binary.
+        out += "00400000-0040b000 r-xp 00000000 08:01 131073                             /bin/cat\n"
+               "0060a000-0060b000 r--p 0000a000 08:01 131073                             /bin/cat\n"
+               "0060b000-0060c000 rw-p 0000b000 08:01 131073                             /bin/cat\n"
+               "7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]\n"
+               "7ffd00050000-7ffd00053000 r--p 00000000 00:00 0                          [vvar]\n"
+               "7ffd00053000-7ffd00055000 r-xp 00000000 00:00 0                          [vdso]\n"
+               "ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]\n";
+        return true;
+    }
+    if (tail == "mounts") { out += FAKE_MOUNTS_PROC; return true; }
+    if (tail == "mountinfo") {
+        out += "23 28 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw\n"
+               "24 28 0:4 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw\n"
+               "25 28 0:6 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=494056k,nr_inodes=123514,mode=755\n"
+               "28 1 252:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw,errors=remount-ro,data=ordered\n";
+        return true;
+    }
+    if (tail == "exe" || tail == "cwd" || tail == "root") {
+        // These are symlinks; cat reads them as ENOENT in some kernels and
+        // EACCES in others. Mirror the most common Ubuntu behavior — a
+        // permission denied for non-owners; for self, cat happily follows
+        // the symlink and prints the binary contents (we don't have those).
+        // Easiest realistic answer: empty file (cat prints nothing).
+        return true;
+    }
+    if (tail.startsWith("fd/") || tail == "fd") {
+        // Skip — let caller report ENOENT for unknown fd entries.
+        return false;
+    }
+    return false;
+}
+
 String FakeShell::cmdCat_(Cmd& c) {
     if (c.argv.size()<2) return "";
     String out;
@@ -851,11 +1256,12 @@ String FakeShell::cmdCat_(Cmd& c) {
         if (abs=="/etc/hostname")   { out += host_; out += "\n"; continue; }
         if (abs=="/etc/hosts")      { out += FAKE_HOSTS; continue; }
         if (abs=="/etc/resolv.conf"){ out += FAKE_RESOLV; continue; }
-        if (abs=="/proc/cpuinfo")   { out += FAKE_CPUINFO; continue; }
-        if (abs=="/proc/meminfo")   { out += FAKE_MEMINFO; continue; }
-        if (abs=="/proc/mounts")    { out += FAKE_MOUNTS_PROC; continue; }
-        if (abs=="/proc/uptime")    { out += FAKE_UPTIME_PROC; continue; }
-        if (abs=="/proc/version")   { out += "Linux version 4.15.0-142-generic (buildd@lcy01-amd64-006) (gcc version 7.5.0 (Ubuntu 7.5.0-3ubuntu1~18.04)) #146-Ubuntu SMP Tue Apr 13 01:11:19 UTC 2021\n"; continue; }
+        // /proc/* files (top-level + per-pid). procVirtualFile_ knows the
+        // current cat invocation so /proc/self/cmdline reflects argv.
+        {
+            String poutbuf;
+            if (procVirtualFile_(abs, c, poutbuf)) { out += poutbuf; continue; }
+        }
         auto* vf = findFile_(abs);
         if (vf) { out += vf->content; continue; }
         // Stubbed home-dir files: list-empty rather than 404 so attackers see consistency

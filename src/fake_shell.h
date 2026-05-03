@@ -172,6 +172,13 @@ private:
     void logCommand_(const String& raw, const std::vector<CmdNode>& chain);
     String passwdFile_() const;
 
+    // Synthesize a /proc/<pid>/<file> or /proc/<topfile> response. Returns
+    // true if `abs` is a recognized /proc path and writes its content to
+    // `out`. `caller` is the cat/head/tail invocation, used for
+    // /proc/self/cmdline so the output reflects the current command exactly
+    // as a real kernel would (NUL-separated argv of the calling process).
+    bool procVirtualFile_(const String& abs, const Cmd& caller, String& out) const;
+
 private:
     String user_;
     String host_;
