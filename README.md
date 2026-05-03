@@ -1,7 +1,8 @@
 # HoneyOpus 🍯
 
-A pocket-sized **Telnet + SSH honeypot** for ESP32-C3 boards with the built-in
-0.42" 72×40 OLED. Records every captured session as an
+A pocket-sized **Telnet + SSH honeypot** for ESP32 boards (C3 SuperMini with
+the built-in 0.42" OLED, LilyGO T-QT Pro with a 128×128 colour IPS, or a
+headless S3-N16R8 module). Records every captured session as an
 [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/), classifies the
 attacker (Mirai bot, IoT loader, manual operator, …), geolocates them, and
 optionally submits the IP to **AbuseIPDB** and **AlienVault OTX** in the
@@ -14,10 +15,12 @@ bundled in.
 
 ## ✨ Install from your browser
 
-Plug an ESP32-C3 board into a USB port and head to
+Plug an ESP32-C3 SuperMini, LilyGO T-QT Pro or ESP32-S3 N16R8 into a USB
+port and head to
 **[kast.github.io/HoneyOpus](https://kast.github.io/HoneyOpus/)**.
 Click *Connect*, pick the serial port, and the latest firmware is flashed in
-seconds — no toolchain, no `pio`, no drivers beyond the stock USB-CDC.
+seconds — no toolchain, no `pio`, no drivers beyond the stock USB-CDC. ESP
+Web Tools auto-detects the chip family and picks the matching image.
 
 The flasher uses [ESP Web Tools](https://esphome.github.io/esp-web-tools/) and
 works in Chrome, Edge and Opera on a desktop computer.
@@ -30,7 +33,7 @@ wire up the right display driver, partition table and concurrency caps.
 | Build env (`-e`) | Chip | Flash / RAM / PSRAM | Display | Telnet cap | Notes |
 |---|---|---|---|---|---|
 | `esp32-c3-oled` *(default)* | ESP32-C3 | 4 MB / 400 KB / — | SSD1306 72×40 mono OLED (I²C GPIO 5/6) | 3 | 01Space SuperMini-class. Heap-tight; SSH gated by free-largest. |
-| `lilygo-t-qt-pro` | ESP32-S3 | 4 MB / 512 KB / 2 MB QSPI | GC9107 128×128 colour IPS (LovyanGFX) | 6 | LilyGO T-QT Pro. Buttons on GPIO 0/47. Display offsets/invert untested on a real device — adjust in `src/display.cpp` if needed. |
+| `lilygo-t-qt-pro` | ESP32-S3 | 4 MB / 512 KB / 2 MB QSPI | 128×128 colour IPS, ST7735-class controller (LovyanGFX) | 6 | LilyGO T-QT Pro. Boot button on GPIO 0. The panel is widely advertised as GC9107 but in practice responds to ST7735-family commands — `src/display.cpp` ships a custom init ported from a known-good native ESP-IDF driver. |
 | `esp32-s3-n16r8` | ESP32-S3 | 16 MB / 512 KB / 8 MB OPI | headless | 8 | Generic N16R8 module. Best honeypot capacity, no UI. Uses `partitions_16mb.csv`. |
 
 Common to all: boot button (`GPIO 9` on C3, `GPIO 0` on S3) acts as the
@@ -201,7 +204,9 @@ running through their full infection chain so the recording is interesting:
 src/
   main.cpp                boot + main loop
   config.{h,cpp}          NVS-backed configuration
-  display.{h,cpp}         OLED state machine (U8g2)
+  display.{h,cpp}         display state machine: U8g2 mono OLED on the
+                          C3, LovyanGFX colour IPS on the T-QT Pro, no-op
+                          stub on the headless N16R8
   icons.h                 boot logo + Telnet/SSH icons (XBM)
   storage.{h,cpp}         LittleFS bring-up + ring trimming
   attack_log.{h,cpp}      JSONL attack log
@@ -228,12 +233,13 @@ web/
 Pushing to `main`/`master` (or hitting *Run workflow* in the Actions tab)
 triggers `.github/workflows/build-and-deploy.yml`, which:
 
-1. Builds the firmware with PlatformIO.
-2. Merges `bootloader + partitions + boot_app0 + app` into a single
-   `firmware.bin` with `esptool.py merge_bin`.
-3. Generates an ESP-Web-Tools `manifest.json` containing the commit SHA and
-   build timestamp.
-4. Publishes everything (HTML + firmware) to **GitHub Pages**.
+1. Builds firmware for all three boards with PlatformIO.
+2. Merges `bootloader + partitions + boot_app0 + app` into one
+   per-chip-family `firmware-*.bin` with `esptool.py merge_bin`.
+3. Generates an ESP-Web-Tools `manifest.json` containing the commit SHA,
+   build timestamp and one entry per chip family so the in-browser
+   flasher picks the right image automatically.
+4. Publishes everything (HTML + firmware images) to **GitHub Pages**.
 
 To enable the site on a fresh fork, go to *Settings → Pages* and set
 **Source = GitHub Actions**. The workflow takes care of the rest.
