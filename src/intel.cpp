@@ -10,8 +10,53 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <vector>
 
 namespace honeyopus {
+
+// ---- per-IP report cooldowns -------------------------------------------
+// AbuseIPDB enforces a 15-minute cooldown when an identical
+// (IP, categories, comment) tuple is reported repeatedly — re-submitting in
+// that window returns HTTP 429 and, if abused, can get the API key revoked.
+// AlienVault OTX silently dedupes indicators within a pulse and applies a
+// 30-req/min burst cap with a 1000-req/day quota. To stay well clear of
+// both, we maintain per-provider, per-IP cooldown maps that suppress
+// duplicate reports inside the configured window.
+//
+// Storage is a tiny bounded vector — ESP32-C3 has very little RAM and the
+// honeypot will only see a handful of attacker IPs at a time. When full we
+// evict the oldest entry.
+struct CdEntry { String ip; uint32_t last_sec; };
+
+static const size_t          kCdMax              = 64;
+static const uint32_t        kAbuseCdSec         = 20 * 60;   // 20 min — AbuseIPDB requires >=15.
+static const uint32_t        kOtxCdSec           = 15 * 60;   // 15 min — OTX dedupes anyway, but spare the burst quota.
+static std::vector<CdEntry>  s_cd_abuse;
+static std::vector<CdEntry>  s_cd_otx;
+
+// Returns true if the IP is OUTSIDE the cooldown window (i.e. it's ok to
+// report now). On true, the entry is updated/inserted with `now`. On false,
+// the caller should skip reporting.
+static bool cooldown_check_(std::vector<CdEntry>& v, const String& ip,
+                            uint32_t now, uint32_t period) {
+    for (auto& e : v) {
+        if (e.ip == ip) {
+            if (now - e.last_sec < period) return false;
+            e.last_sec = now;
+            return true;
+        }
+    }
+    if (v.size() >= kCdMax) {
+        // evict oldest
+        size_t oldest = 0;
+        for (size_t i = 1; i < v.size(); ++i) {
+            if (v[i].last_sec < v[oldest].last_sec) oldest = i;
+        }
+        v.erase(v.begin() + oldest);
+    }
+    v.push_back({ip, now});
+    return true;
+}
 
 // RFC1918 / loopback / link-local / CGNAT / IPv6 ULA & link-local. We never
 // report these to public threat-intel feeds — submitting LAN addresses pollutes
@@ -47,6 +92,13 @@ bool intel_report_abuseipdb(AttackEntry& e) {
     if (e.reported_abuseipdb) return true;
     if (intel_ip_is_private(e.ip)) {
         Serial.printf("[abuseipdb] skip private/LAN ip=%s\n", e.ip.c_str());
+        return false;
+    }
+    // AbuseIPDB rejects repeat (IP, categories, comment) submissions within
+    // 15 min. Suppress on our side with a slightly larger window.
+    uint32_t now = (uint32_t)(millis() / 1000);
+    if (!cooldown_check_(s_cd_abuse, e.ip, now, kAbuseCdSec)) {
+        Serial.printf("[abuseipdb] cooldown skip ip=%s\n", e.ip.c_str());
         return false;
     }
 
@@ -178,6 +230,14 @@ bool intel_report_otx(AttackEntry& e) {
     if (e.reported_otx) return true;
     if (intel_ip_is_private(e.ip)) {
         Serial.printf("[otx] skip private/LAN ip=%s\n", e.ip.c_str());
+        return false;
+    }
+    // OTX dedupes indicators inside a pulse on its end, but we still want to
+    // avoid burning quota / hitting the 30-req/min burst cap on a flood of
+    // attempts from the same attacker.
+    uint32_t now = (uint32_t)(millis() / 1000);
+    if (!cooldown_check_(s_cd_otx, e.ip, now, kOtxCdSec)) {
+        Serial.printf("[otx] cooldown skip ip=%s\n", e.ip.c_str());
         return false;
     }
 
