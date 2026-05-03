@@ -216,18 +216,13 @@ static void tn_finalize(TnSession* s) {
     if (s->finalized) return;
     s->finalized = true;
     registry_remove(s);
-    // Detach AsyncTCP callbacks so any further events on this client (e.g.
-    // onDisconnect arriving after onError finalized us) won't deref a freed
-    // TnSession. We pass nullptr both as cb and arg.
-    if (s->client) {
-        s->client->onDisconnect(nullptr, nullptr);
-        s->client->onError(nullptr, nullptr);
-        s->client->onTimeout(nullptr, nullptr);
-        s->client->onData(nullptr, nullptr);
-        s->client->onPoll(nullptr, nullptr);
-    }
     // Hand the slow FS / intel work off to the worker so we don't block the
     // AsyncTCP poll task (lwIP gets very upset about that under load).
+    // We do NOT detach AsyncTCP callbacks here: calling onDisconnect/onError/
+    // onPoll(nullptr,nullptr) takes AsyncTCP's internal lock, which deadlocks
+    // when this is called from the main-loop reaper while AsyncTCP is itself
+    // blocked (e.g. in a slow Serial.printf). Instead, the callbacks
+    // themselves check s->finalized and short-circuit.
     TnFinalizeJob j{ .sess = s };
     if (s_finalize_q && xQueueSend(s_finalize_q, &j, 0) == pdTRUE) return;
     // Queue full or not initialized — finalize inline as a fallback.
@@ -295,36 +290,35 @@ static void tn_on_data(void* arg, AsyncClient* /*c*/, void* data, size_t len) {
 static void tn_on_disconnect(void* arg, AsyncClient* /*c*/) {
     auto* s = (TnSession*)arg;
     if (!s) return;
-    // Note: tn_finalize handles delete (and the active-counter decrement) so
-    // it can be done from the worker task instead of here.
+    if (s->finalized) {
+        // Reaper already queued cleanup; just delete the shell-only struct.
+        delete s;
+        return;
+    }
     tn_finalize(s);
 }
 
 static void tn_on_error(void* arg, AsyncClient* /*c*/, int8_t error) {
     auto* s = (TnSession*)arg;
     if (!s) return;
+    if (s->finalized) return;
     Serial.printf("[telnet] error %d on id=%u\n", (int)error, (unsigned)s->entry.id);
-    // AsyncTCP does NOT guarantee onDisconnect fires after onError; without
-    // this the TnSession (and ~100 KB of associated state) leaks forever.
-    tn_finalize(s);
+    // Don't finalize here — AsyncTCP will fire onDisconnect right after, and
+    // doing it here can race with a concurrent reaper. The disconnect path
+    // owns the lifecycle.
 }
 
 static void tn_on_timeout(void* arg, AsyncClient* c, uint32_t /*time*/) {
     auto* s = (TnSession*)arg;
+    if (s && s->finalized) return;
     if (c) c->close();
-    if (s) tn_finalize(s);
 }
 
 static void tn_on_poll(void* arg, AsyncClient* c) {
     auto* s = (TnSession*)arg;
-    if (!s || !c) return;
-    // Hard wall-clock cap. Bots either dump their payload in <1 s or open a
-    // TCP socket and idle to pin the listener; either way 15 s is plenty to
-    // capture intent.
+    if (!s || !c || s->finalized) return;
     constexpr uint32_t kTnMaxSessionMs = 15000;
     if (millis() - s->t0 > kTnMaxSessionMs) {
-        Serial.printf("[telnet] session %u capped at %ums\n",
-                      (unsigned)s->entry.id, (unsigned)kTnMaxSessionMs);
         c->close();
     }
 }
@@ -336,7 +330,10 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     String peer_ip = c->remoteIP().toString();
     if (!g_gate.admit(peer_ip)) {
         g_gate.incTelnetGated();
-        Serial.printf("[telnet] gated %s (cooldown)\n", peer_ip.c_str());
+        // No per-connection Serial.printf here: a fast attacker can fire 30+
+        // gated connections per second, which floods HWCDC and stalls the
+        // AsyncTCP task inside Serial.printf. The total/gated counters in
+        // the [health] log are sufficient.
         c->close();
         return;
     }
@@ -398,21 +395,30 @@ void telnet_begin() {
 void telnet_reap() {
     constexpr uint32_t kTnMaxSessionMs = 15000;
     uint32_t now = millis();
-    TnSession* victims[TN_MAX_CONCURRENT] = {nullptr, nullptr, nullptr};
+    AsyncClient* victims[TN_MAX_CONCURRENT] = {nullptr, nullptr, nullptr};
+    uint32_t     vids[TN_MAX_CONCURRENT]    = {0, 0, 0};
     size_t n = 0;
     portENTER_CRITICAL(&s_reg_mux);
     for (auto& slot : s_registry) {
         if (slot && !slot->finalized && (now - slot->t0) > kTnMaxSessionMs) {
-            victims[n++] = slot;
+            victims[n] = slot->client;
+            vids[n] = slot->entry.id;
+            ++n;
         }
     }
     portEXIT_CRITICAL(&s_reg_mux);
+    // Important: do NOT call tn_finalize from the reaper. The worker task
+    // owns the lifetime of TnSession*, and AsyncTCP still holds a pointer
+    // to it as the callback `arg`. Deleting s here would cause a UAF when
+    // AsyncTCP later fires onDisconnect. A graceful close() is enough —
+    // AsyncTCP will fire onDisconnect, which goes through the normal path.
+    // We also do NOT touch any AsyncTCP setter API (which would deadlock
+    // with a Serial-blocked AsyncTCP task).
     for (size_t i = 0; i < n; ++i) {
-        TnSession* s = victims[i];
-        Serial.printf("[telnet] reaper closed session id=%u age=%ums\n",
-                      (unsigned)s->entry.id, (unsigned)(now - s->t0));
-        if (s->client) s->client->close(true);
-        tn_finalize(s);
+        if (victims[i]) {
+            Serial.printf("[telnet] reaper closing session id=%u\n", (unsigned)vids[i]);
+            victims[i]->close();
+        }
     }
 }
 

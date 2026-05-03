@@ -486,7 +486,7 @@ static void ssh_listener_task(void*) {
             g_gate.incSsh();
             if (peer_ip.length() && !g_gate.admit(peer_ip)) {
                 g_gate.incSshGated();
-                Serial.printf("[ssh] gated %s (cooldown)\n", peer_ip.c_str());
+                // Silent gate — Serial flooding stalls the listener.
                 ssh_disconnect(sess);
                 ssh_free(sess);
                 continue;
