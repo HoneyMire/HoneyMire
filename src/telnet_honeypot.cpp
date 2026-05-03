@@ -88,6 +88,7 @@ struct TnSession {
     int      iac_state = 0;    // 0=normal,1=after IAC,2=after IAC+cmd,3=in subneg
     uint32_t t0 = 0;
     bool     finalized = false;
+    bool     stuck_logged = false; // set once when reaper first reports leak
 };
 
 // Send `n` bytes, looping over short writes. AsyncTCP's add()/write() may
@@ -395,15 +396,16 @@ void telnet_begin() {
 void telnet_reap() {
     constexpr uint32_t kTnMaxSessionMs = 15000;
     uint32_t now = millis();
-    AsyncClient* victims[TN_MAX_CONCURRENT] = {nullptr, nullptr, nullptr};
-    uint32_t     vids[TN_MAX_CONCURRENT]    = {0, 0, 0};
+    uint32_t vids[TN_MAX_CONCURRENT] = {0, 0, 0};
     size_t n = 0;
     portENTER_CRITICAL(&s_reg_mux);
     for (auto& slot : s_registry) {
         if (slot && !slot->finalized && (now - slot->t0) > kTnMaxSessionMs) {
-            victims[n] = slot->client;
-            vids[n] = slot->entry.id;
-            ++n;
+            if (!slot->stuck_logged) {
+                vids[n] = slot->entry.id;
+                ++n;
+                slot->stuck_logged = true;
+            }
         }
     }
     portEXIT_CRITICAL(&s_reg_mux);
@@ -418,12 +420,12 @@ void telnet_reap() {
     // We accept the trade-off: a session whose poll callback stops firing
     // stays in the registry until reboot. With max 3 concurrent slots and
     // the 5 min IP cooldown gate, leakage is bounded. The heap watchdog
-    // will reboot the device if it ever matters.
+    // will reboot the device if it ever matters. We log at most once per
+    // stuck session — re-logging every 1 Hz reap pass floods Serial and
+    // can re-introduce the HWCDC-TX-saturation deadlock we just fixed.
     for (size_t i = 0; i < n; ++i) {
-        if (victims[i]) {
-            Serial.printf("[telnet] reaper: session id=%u stuck (>%us), leaking until reboot\n",
-                          (unsigned)vids[i], (unsigned)(kTnMaxSessionMs / 1000));
-        }
+        Serial.printf("[telnet] reaper: session id=%u stuck (>%us), leaking until reboot\n",
+                      (unsigned)vids[i], (unsigned)(kTnMaxSessionMs / 1000));
     }
 }
 
