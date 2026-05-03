@@ -89,6 +89,8 @@ struct TnSession {
     uint32_t t0 = 0;
     bool     finalized = false;
     bool     stuck_logged = false; // set once when reaper first reports leak
+    uint32_t stuck_at_ms = 0;      // millis() when stuck was first detected
+    bool     close_attempted = false; // reaper has tried to close() once
 };
 
 // Send `n` bytes, looping over short writes. AsyncTCP's add()/write() may
@@ -394,38 +396,64 @@ void telnet_begin() {
 }
 
 void telnet_reap() {
-    constexpr uint32_t kTnMaxSessionMs = 15000;
+    // Phase 1: 15 s after t0, mark the session "stuck" and ask AsyncTCP to
+    //          close it. The v3 lwIP-rcv-window patch makes close() from
+    //          the main loop safe again; before that, calling close() here
+    //          could panic the device.
+    // Phase 2: if 30 s after the close attempt the slot is still occupied,
+    //          we've truly leaked it. Better to spend a clean reboot than
+    //          to limp along with reduced capacity (and possibly all 3
+    //          slots gone — at which point Telnet is fully dead anyway).
+    constexpr uint32_t kTnMaxSessionMs   = 15000;
+    constexpr uint32_t kTnRebootAfterMs  = 30000;
     uint32_t now = millis();
-    uint32_t vids[TN_MAX_CONCURRENT] = {0, 0, 0};
-    size_t n = 0;
+
+    uint32_t log_vids[TN_MAX_CONCURRENT] = {0, 0, 0};
+    size_t   log_n = 0;
+    AsyncClient* close_victims[TN_MAX_CONCURRENT] = {nullptr, nullptr, nullptr};
+    size_t   close_n = 0;
+    bool     reboot_needed = false;
+    uint32_t reboot_vid = 0;
+
     portENTER_CRITICAL(&s_reg_mux);
     for (auto& slot : s_registry) {
-        if (slot && !slot->finalized && (now - slot->t0) > kTnMaxSessionMs) {
-            if (!slot->stuck_logged) {
-                vids[n] = slot->entry.id;
-                ++n;
-                slot->stuck_logged = true;
-            }
+        if (!slot || slot->finalized) continue;
+        if ((now - slot->t0) <= kTnMaxSessionMs) continue;
+        if (!slot->stuck_logged) {
+            slot->stuck_logged   = true;
+            slot->stuck_at_ms    = now;
+            log_vids[log_n++]    = slot->entry.id;
+        }
+        if (!slot->close_attempted && slot->client) {
+            slot->close_attempted    = true;
+            close_victims[close_n++] = slot->client;
+        } else if (slot->close_attempted &&
+                   (now - slot->stuck_at_ms) > kTnRebootAfterMs) {
+            reboot_needed = true;
+            reboot_vid    = slot->entry.id;
+            break;
         }
     }
     portEXIT_CRITICAL(&s_reg_mux);
-    // Reaper used to call victims[i]->close() from main loop, but doing so
-    // while lwIP is concurrently processing an ACK/packet on the same pcb
-    // can trigger the lwIP assertion
-    //   tcp_update_rcv_ann_wnd: new_rcv_ann_wnd <= 0xffff
-    // — the receive-window update races against tcp_close()/tcp_recved()
-    // and overflows. Calling AsyncClient::close() from a task other than
-    // the AsyncTCP/lwIP task is simply not safe under load.
-    //
-    // We accept the trade-off: a session whose poll callback stops firing
-    // stays in the registry until reboot. With max 3 concurrent slots and
-    // the 5 min IP cooldown gate, leakage is bounded. The heap watchdog
-    // will reboot the device if it ever matters. We log at most once per
-    // stuck session — re-logging every 1 Hz reap pass floods Serial and
-    // can re-introduce the HWCDC-TX-saturation deadlock we just fixed.
-    for (size_t i = 0; i < n; ++i) {
-        Serial.printf("[telnet] reaper: session id=%u stuck (>%us), leaking until reboot\n",
-                      (unsigned)vids[i], (unsigned)(kTnMaxSessionMs / 1000));
+
+    // Log once per stuck session — re-logging every 1 Hz pass floods Serial
+    // and can re-introduce the HWCDC-TX-saturation deadlock we just fixed.
+    for (size_t i = 0; i < log_n; ++i) {
+        Serial.printf("[telnet] reaper: session id=%u stuck (>%us), closing\n",
+                      (unsigned)log_vids[i], (unsigned)(kTnMaxSessionMs / 1000));
+    }
+    // Best-effort close. AsyncTCP marshals close onto the tcpip thread, so
+    // the call itself is thread-safe; the v3 patch guarantees the
+    // tcp_recved() that may follow can't overflow rcv_ann_wnd.
+    for (size_t i = 0; i < close_n; ++i) {
+        if (close_victims[i]) close_victims[i]->close(true);
+    }
+    if (reboot_needed) {
+        Serial.printf("[telnet] reaper: session id=%u still stuck after close, rebooting\n",
+                      (unsigned)reboot_vid);
+        Serial.flush();
+        delay(50);
+        ESP.restart();
     }
 }
 
