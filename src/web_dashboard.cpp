@@ -201,8 +201,8 @@ static AwsResponseFiller make_seg_filler(std::shared_ptr<SegPage> p) {
 // `operator new` throws std::bad_alloc, which propagates out of the
 // async_tcp callback and __terminate aborts the device. Bail out early
 // with a 503 in that case — clients can retry.
-static const size_t kWebMinHeap        = 24 * 1024;
-static const size_t kWebMinLargestBlk  = 12 * 1024;
+static const size_t kWebMinHeap        = 20 * 1024;
+static const size_t kWebMinLargestBlk  = 6 * 1024;
 
 static bool web_heap_ok_(AsyncWebServerRequest* req, const char* tag) {
     size_t free_heap = ESP.getFreeHeap();
@@ -228,13 +228,19 @@ static void send_dashboard(AsyncWebServerRequest* req) {
     if (!authed(req)) return req->requestAuthentication();
     if (!web_heap_ok_(req, "/")) return;
 
-    auto v = g_attack_log.recent(50);
-    size_t total = g_attack_log.count();
-    size_t ssh_n = 0, tn_n = 0, authed_n = 0;
-    for (auto& e : v) {
+    // KPI pass: count under the lock without copying entries. The previous
+    // implementation copied the entire recent vector (50 × ~16 String fields)
+    // which produced a flurry of small mallocs that catastrophically
+    // fragmented the heap and aborted lock_init_generic on the next mutex
+    // creation. forEachRecent iterates by const-reference under the lock.
+    size_t v_size = 0, ssh_n = 0, tn_n = 0, authed_n = 0;
+    g_attack_log.forEachRecent(50, [&](const AttackEntry& e) {
+        ++v_size;
         if (e.protocol == "ssh") ssh_n++; else tn_n++;
         if (e.authenticated) authed_n++;
-    }
+        return true;
+    });
+    size_t total = g_attack_log.count();
     bool ssh_enabled = g_config.get().ssh_enabled;
     bool ssh_running = ssh_listener_running();
     bool wifi_ok     = wifi_mode() == NetMode::OnlineSTA;
@@ -244,7 +250,7 @@ static void send_dashboard(AsyncWebServerRequest* req) {
     size_t free_kb = (total_b > used_b) ? (total_b - used_b) / 1024 : 0;
 
     auto pg = std::make_shared<SegPage>();
-    pg->segs.reserve(16 + v.size());
+    pg->segs.reserve(16 + v_size);
 
     pg->segs.emplace_back(FPSTR(PAGE_HEAD));
     pg->segs.emplace_back(FPSTR(PAGE_NAV));
@@ -285,7 +291,7 @@ static void send_dashboard(AsyncWebServerRequest* req) {
 
     // ---- recent attacks card ----
     pg->segs.emplace_back(F("<div class='card'><h3 style='margin:4px 0 12px'>Recent attacks</h3>"));
-    if (v.empty()) {
+    if (v_size == 0) {
         pg->segs.emplace_back(F("<p class='meta'>No attacks captured yet. Telnet listener is on port 23, SSH on port 22. "
                                 "Forward those ports from your edge router to this device's IP to start collecting.</p>"));
     } else {
@@ -293,7 +299,7 @@ static void send_dashboard(AsyncWebServerRequest* req) {
                                 "<th>Source</th><th>Geo</th><th class='c'>Profile</th>"
                                 "<th>Creds</th><th class='c'>Auth</th><th class='c'>Cmds</th>"
                                 "<th class='c'>Recording</th><th class='c'>Reported</th></tr></thead><tbody>"));
-        for (auto& e : v) {
+        g_attack_log.forEachRecent(50, [&](const AttackEntry& e) {
             String row;
             row.reserve(720);
             char hdr[80];
@@ -311,8 +317,6 @@ static void send_dashboard(AsyncWebServerRequest* req) {
                 row += F("<span class='flag' title='LAN / private network' aria-label='LAN'>&#x1F3E0;</span>");
             } else if (e.country_code.length()) {
                 String cc = e.country_code; cc.toUpperCase();
-                // Build a rich tooltip that combines country, city and ISP so
-                // the column itself stays compact: just the flag glyph.
                 String tip = e.country.length() ? e.country : cc;
                 if (e.city.length())   { tip += " · "; tip += e.city; }
                 if (e.region.length()) { tip += " · "; tip += e.region; }
@@ -363,10 +367,11 @@ static void send_dashboard(AsyncWebServerRequest* req) {
                 : F("<span class='repicon off' title='AbuseIPDB not reported' aria-label='AbuseIPDB not reported'>&#x1F6E1;&#xFE0F;</span>");
             row += e.reported_otx
                 ? F("<span class='repicon' title='AlienVault OTX reported' aria-label='OTX reported'>&#x1F989;</span>")
-                : F("<span class='repicon off' title='AlienVault OTX not reported' aria-label='OTX not reported'>&#x1F989;</span>");
+                : F("<span class='repicon off' title='AlienVault OTX not reported' aria-label='AlienVault OTX not reported'>&#x1F989;</span>");
             row += "</td></tr>";
             pg->segs.push_back(std::move(row));
-        }
+            return true;
+        });
         pg->segs.emplace_back(F("</tbody></table>"));
     }
     pg->segs.emplace_back(F("</div>"));

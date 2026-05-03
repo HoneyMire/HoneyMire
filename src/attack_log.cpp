@@ -215,6 +215,15 @@ std::vector<AttackEntry> AttackLog::recent(size_t limit) {
     return std::vector<AttackEntry>(entries_.begin(), entries_.begin() + limit);
 }
 
+void AttackLog::forEachRecent(size_t limit,
+                              const std::function<bool(const AttackEntry&)>& fn) {
+    LogLock lk(mtx_);
+    size_t n = (limit == 0 || limit > entries_.size()) ? entries_.size() : limit;
+    for (size_t i = 0; i < n; ++i) {
+        if (!fn(entries_[i])) break;
+    }
+}
+
 bool AttackLog::getById(uint32_t id, AttackEntry& out) {
     LogLock lk(mtx_);
     for (auto& e : entries_) if (e.id == id) { out = e; return true; }

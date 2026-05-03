@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <functional>
 
 namespace honeyopus {
 
@@ -54,6 +55,11 @@ public:
     void append(const AttackEntry& e);
     void update(const AttackEntry& e);            // replace-by-id in cache + append delta line
     std::vector<AttackEntry> recent(size_t limit);
+    // Iterate the most recent entries under the lock without copying. The
+    // visitor receives a const reference; returning false stops iteration.
+    // This avoids heap spikes from copying ~16 heap-backed String fields per
+    // entry × N rows when rendering pages.
+    void forEachRecent(size_t limit, const std::function<bool(const AttackEntry&)>& fn);
     bool getById(uint32_t id, AttackEntry& out);
     size_t count();
     // Truncate the on-disk log. Resets next_id_ to 1.
