@@ -303,31 +303,29 @@ static void send_dashboard(AsyncWebServerRequest* req) {
 static void send_config_page(AsyncWebServerRequest* req) {
     if (!authed(req)) return req->requestAuthentication();
     auto& c = g_config.get();
-    String body;
-    body.reserve(6000);
-    body += FPSTR(PAGE_HEAD);
-    body += FPSTR(PAGE_NAV);
-    body += "<div class='card'><h3>Configuration</h3>"
-            "<form method='POST' action='/config'>";
+    AsyncResponseStream* s = req->beginResponseStream("text/html; charset=utf-8");
+    s->print(FPSTR(PAGE_HEAD));
+    s->print(FPSTR(PAGE_NAV));
+    s->print("<div class='card'><h3>Configuration</h3>"
+             "<form method='POST' action='/config'>");
     auto field = [&](const char* label, const char* name, const String& val, const char* type = "text") {
-        body += "<div class='row'><label>"; body += label; body += "</label>";
-        body += "<input type='"; body += type; body += "' name='"; body += name; body += "' value='";
-        body += html_escape(val); body += "'/></div>";
+        s->printf("<div class='row'><label>%s</label>"
+                  "<input type='%s' name='%s' value='%s'/></div>",
+                  label, type, name, html_escape(val).c_str());
     };
     auto checkbox = [&](const char* label, const char* name, bool val) {
-        body += "<div class='row'><label>"; body += label; body += "</label>"
-                "<label class='switch'>"
-                "<input type='hidden' name='"; body += name; body += "' value='0'/>"
-                "<input type='checkbox' name='"; body += name; body += "' value='1'";
-        if (val) body += " checked";
-        body += "/><span class='slider'></span></label></div>";
+        s->printf("<div class='row'><label>%s</label>"
+                  "<label class='switch'>"
+                  "<input type='hidden' name='%s' value='0'/>"
+                  "<input type='checkbox' name='%s' value='1'%s/>"
+                  "<span class='slider'></span></label></div>",
+                  label, name, name, val ? " checked" : "");
     };
     auto sec_open  = [&](const char* title, bool open = true) {
-        body += "<details class='section'";
-        if (open) body += " open";
-        body += "><summary>"; body += title; body += "</summary><div class='body'>";
+        s->printf("<details class='section'%s><summary>%s</summary><div class='body'>",
+                  open ? " open" : "", title);
     };
-    auto sec_close = [&]() { body += "</div></details>"; };
+    auto sec_close = [&]() { s->print("</div></details>"); };
 
     sec_open("\xF0\x9F\x93\xB6 Wi-Fi");
     field("WiFi SSID", "wifi_ssid", c.wifi_ssid);
@@ -349,8 +347,8 @@ static void send_config_page(AsyncWebServerRequest* req) {
     sec_open("\xF0\x9F\x94\x90 Dashboard auth", false);
     field("User", "dashboard_user", c.dashboard_user);
     field("Password", "dashboard_pass", c.dashboard_pass, "password");
-    body += "<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
-            "Authentication is automatically bypassed for clients on the local network.</p>";
+    s->print("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
+             "Authentication is automatically bypassed for clients on the local network.</p>");
     sec_close();
 
     sec_open("\xF0\x9F\x8C\x8D Geolocation", false);
@@ -365,8 +363,8 @@ static void send_config_page(AsyncWebServerRequest* req) {
     checkbox("AlienVault OTX", "otx_enabled", c.otx_enabled);
     field("OTX API key", "otx_key", c.otx_key, "password");
     field("OTX pulse name", "otx_pulse_name", c.otx_pulse_name);
-    body += "<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
-            "Attacks coming from LAN/private IPs are never reported.</p>";
+    s->print("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
+             "Attacks coming from LAN/private IPs are never reported.</p>");
     sec_close();
 
     sec_open("\xE2\x8F\xB0 Time &amp; NTP", false);
@@ -374,10 +372,10 @@ static void send_config_page(AsyncWebServerRequest* req) {
     field("NTP server #1", "ntp_server1", c.ntp_server1);
     field("NTP server #2", "ntp_server2", c.ntp_server2);
     field("NTP server #3", "ntp_server3", c.ntp_server3);
-    body += "<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
-            "Examples: <code>CET-1CEST,M3.5.0,M10.5.0/3</code> (Europe), "
-            "<code>EST5EDT,M3.2.0,M11.1.0</code> (US East), "
-            "<code>UTC0</code>. Re-applied immediately on save.</p>";
+    s->print("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
+             "Examples: <code>CET-1CEST,M3.5.0,M10.5.0/3</code> (Europe), "
+             "<code>EST5EDT,M3.2.0,M11.1.0</code> (US East), "
+             "<code>UTC0</code>. Re-applied immediately on save.</p>");
     sec_close();
 
     sec_open("\xF0\x9F\x96\xA5\xEF\xB8\x8F Display", false);
@@ -396,23 +394,23 @@ static void send_config_page(AsyncWebServerRequest* req) {
           String((unsigned)c.max_session_dir_kb), "number");
     sec_close();
 
-    body += "<div class='row'><label></label><div>"
-            "<button type='submit'>Save</button> "
-            "<button type='button' class='alt' onclick=\"location.href='/'\">Cancel</button>"
-            "</div></div></form>";
+    s->print("<div class='row'><label></label><div>"
+             "<button type='submit'>Save</button> "
+             "<button type='button' class='alt' onclick=\"location.href='/'\">Cancel</button>"
+             "</div></div></form>");
 
     // ---- Danger zone ----
-    body += "<h4 style='color:#e94560;margin-top:24px'>Danger zone</h4>"
-            "<p class='meta' style='margin:-6px 0 10px'>"
-            "Permanently deletes all recorded sessions and attack-log entries. "
-            "Configuration (WiFi, API keys, …) is preserved.</p>"
-            "<button type='button' class='danger' onclick=\"showClear()\">"
-            "&#x1F5D1;&#xFE0F; Clear all attack history</button>";
+    s->print("<h4 style='color:#e94560;margin-top:24px'>Danger zone</h4>"
+             "<p class='meta' style='margin:-6px 0 10px'>"
+             "Permanently deletes all recorded sessions and attack-log entries. "
+             "Configuration (WiFi, API keys, …) is preserved.</p>"
+             "<button type='button' class='danger' onclick=\"showClear()\">"
+             "&#x1F5D1;&#xFE0F; Clear all attack history</button>");
 
-    body += "</div>";  // close .card
+    s->print("</div>");  // close .card
 
     // ---- Confirmation modal ----
-    body += R"HTML(
+    s->print(R"HTML(
 <div class="modal-bg" id="clearModal">
   <div class="modal" role="dialog" aria-labelledby="clrTitle" aria-modal="true">
     <h3 id="clrTitle">&#x26A0;&#xFE0F; Clear all attack history?</h3>
@@ -445,9 +443,9 @@ function doClear(){
       alert('Clear failed: '+err);});
 }
 </script>
-)HTML";
-    body += FPSTR(PAGE_FOOT);
-    req->send(200, "text/html; charset=utf-8", body);
+)HTML");
+    s->print(FPSTR(PAGE_FOOT));
+    req->send(s);
 }
 
 static void handle_config_post(AsyncWebServerRequest* req) {
@@ -461,6 +459,7 @@ static void handle_config_post(AsyncWebServerRequest* req) {
         bool found = false, on = false;
         for (size_t i = 0; i < req->params(); ++i) {
             const AsyncWebParameter* p = req->getParam(i);
+            if (!p) continue;
             if (p->isPost() && p->name() == n) {
                 found = true;
                 if (p->value() == "1") on = true;
