@@ -28,15 +28,19 @@ namespace honeyopus {
 // Per-session inactivity ceiling. libssh's blocking ssh_message_get / recv
 // has no built-in timeout, so a slow-loris attacker (TCP connect, finish
 // KEX, then sit silent) would pin the SSH listener forever — and on
-// ESP32-C3 each live libssh session occupies ~100 KB of heap. We've seen
-// largest-block collapse from ~104 KB to ~9 KB the moment one such peer
-// arrives, fragmenting the heap badly enough that AsyncWebServer can no
-// longer accept new connections.
+// ESP32-C3 each live libssh session occupies ~100 KB of heap.
 //
-// SO_RCVTIMEO/SO_SNDTIMEO on the session FD makes recv/send return
-// EAGAIN, which libssh propagates as a session error so handle_session
-// exits cleanly and frees the buffers.
-static const int kSshSocketTimeoutSec = 60;
+// SO_RCVTIMEO/SO_SNDTIMEO on the session FD makes blocking recv/send
+// inside libssh return EAGAIN promptly so our wall-clock deadline checks
+// can actually fire.
+static const int      kSshSocketTimeoutSec = 5;
+// Hard ceiling on a single SSH session's wall-clock duration. Bots and
+// dropper scripts complete the entire authenticate-and-run-payload
+// sequence in well under a second; anything slower than this is either a
+// human poking around (not what we're here for) or a slow-loris attack.
+// We'd rather drop the connection and free the ~100 KB libssh footprint
+// for the next attacker than fingerprint a bored human.
+static const uint32_t kSshMaxSessionMs    = 15000;
 
 // LittleFS in Arduino-ESP32 mounts at the VFS base "/littlefs". libssh fopen()s
 // from this VFS path; the Arduino LittleFS API uses paths *without* the prefix.
@@ -113,7 +117,8 @@ static void chan_write(ssh_channel chan, Asciinema& cast, const String& s) {
     chan_write(chan, cast, s.c_str(), s.length());
 }
 
-static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entry, Asciinema& cast) {
+static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entry, Asciinema& cast,
+                           uint32_t session_deadline) {
     auto& cfg = g_config.get();
     FakeShell shell;
     shell.begin(entry.user.length() ? entry.user : String(cfg.fake_user), cfg.fake_hostname);
@@ -124,18 +129,16 @@ static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entr
 
     String line;
     char buf[128];
-    uint32_t idle_deadline = millis() + 120000;
     while (!shell.exitRequested() && !shell.sessionLimitsExceeded() &&
-           ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
+           ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan) &&
+           millis() < session_deadline) {
         int n = ssh_channel_read_nonblocking(chan, buf, sizeof(buf), 0);
         if (n == SSH_ERROR) break;
         if (n == 0) {
-            if (millis() > idle_deadline) break;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
         cast.in(buf, n);
-        idle_deadline = millis() + 120000;
         for (int i = 0; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
             if (c == '\r' || c == '\n') {
@@ -221,7 +224,9 @@ static void handle_session(ssh_session sess) {
     int attempts = 0;
     String last_user, last_pass;
     String collected_pubkeys;
-    while (!authed && attempts < cfg.login_attempts_before_accept + 5 && ssh_is_connected(sess)) {
+    const uint32_t session_deadline = t0 + kSshMaxSessionMs;
+    while (!authed && attempts < cfg.login_attempts_before_accept + 5 &&
+           ssh_is_connected(sess) && millis() < session_deadline) {
         ssh_message msg = ssh_message_get(sess);
         if (!msg) break;
         int type = ssh_message_type(msg);
@@ -303,8 +308,8 @@ static void handle_session(ssh_session sess) {
 
     ssh_channel chan = nullptr;
     if (authed) {
-        // Wait for a session channel.
-        uint32_t deadline = millis() + 8000;
+        // Wait for a session channel — bounded by the global session deadline.
+        uint32_t deadline = session_deadline;
         while (!chan && millis() < deadline && ssh_is_connected(sess)) {
             ssh_message msg = ssh_message_get(sess);
             if (!msg) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
@@ -320,7 +325,7 @@ static void handle_session(ssh_session sess) {
         bool ready = false;
         bool exec_run = false;
         String exec_cmd;
-        deadline = millis() + 8000;
+        deadline = session_deadline;
         while (chan && !ready && millis() < deadline && ssh_is_connected(sess)) {
             ssh_message msg = ssh_message_get(sess);
             if (!msg) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
@@ -361,7 +366,7 @@ static void handle_session(ssh_session sess) {
                 entry.commands = 1;
                 classify_attack(entry, exec_cmd, millis(), millis());
             } else {
-                run_fake_shell(sess, chan, entry, cast);
+                run_fake_shell(sess, chan, entry, cast, session_deadline);
             }
             ssh_channel_send_eof(chan);
             ssh_channel_close(chan);
