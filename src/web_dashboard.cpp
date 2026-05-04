@@ -239,7 +239,7 @@ static void send_dashboard(AsyncWebServerRequest* req) {
     g_attack_log.forEachRecent(50, [&](const AttackEntry& e) {
         ++v_size;
         if (e.protocol == "ssh") ssh_n++; else tn_n++;
-        if (e.authenticated) authed_n++;
+        if (e.auth_attempts > 0) authed_n++;
         return true;
     });
     size_t total = g_attack_log.count();
@@ -348,9 +348,21 @@ static void send_dashboard(AsyncWebServerRequest* req) {
             row += "</code> / <code>";
             row += html_escape(e.pass);
             row += "</code></td>";
-            row += e.authenticated
-                ? F("<td class='c'><span class='badge ok'>yes</span></td>")
-                : F("<td class='c'><span class='badge no'>no</span></td>");
+            if (e.auth_attempts > 0) {
+                String tip = String((unsigned)e.auth_attempts) + " credential attempt" +
+                             (e.auth_attempts == 1 ? "" : "s") + " captured" +
+                             (e.authenticated ? "; shell granted" : "");
+                row += F("<td class='c'><span class='badge ok' title='");
+                row += tip;
+                row += F("'>yes");
+                if (e.auth_attempts > 1) {
+                    row += F(" &times;");
+                    row += String((unsigned)e.auth_attempts);
+                }
+                row += F("</span></td>");
+            } else {
+                row += F("<td class='c'><span class='badge no' title='no credential attempt'>no</span></td>");
+            }
             char cmds[48];
             snprintf(cmds, sizeof(cmds), "<td class='c'>%u</td>", (unsigned)e.commands);
             row += cmds;
@@ -736,7 +748,16 @@ static void send_play_page(AsyncWebServerRequest* req) {
     if (e.city.length())  { s->print(" · "); s->print(html_escape(e.city)); }
     s->print(" · creds <code>"); s->print(html_escape(e.user));
     s->print("</code>/<code>");  s->print(html_escape(e.pass));
-    s->print("</code> · ");      s->print(e.authenticated ? "logged in" : "rejected");
+    s->print("</code> · ");
+    if (e.auth_attempts == 0) {
+        s->print("no login attempt");
+    } else if (e.authenticated) {
+        s->printf("shell granted (%u attempt%s)", (unsigned)e.auth_attempts,
+                  e.auth_attempts == 1 ? "" : "s");
+    } else {
+        s->printf("creds captured (%u attempt%s, no shell)",
+                  (unsigned)e.auth_attempts, e.auth_attempts == 1 ? "" : "s");
+    }
     s->printf(" · %.1fs</p>", e.duration_ms / 1000.0f);
     if (e.pubkeys.length()) {
         s->print("<details class='card' style='margin:8px 0;background:#1a1a2e'>"

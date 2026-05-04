@@ -159,6 +159,7 @@ static void tn_handle_complete_line(TnSession* s) {
         s->attempts++;
         s->entry.user = s->pending_user;
         s->entry.pass = line;
+        s->entry.auth_attempts = s->attempts;
         if (s->attempts >= cfg.login_attempts_before_accept) {
             s->entry.authenticated = true;
             s->phase = TnSession::P_SHELL;

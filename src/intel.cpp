@@ -506,6 +506,7 @@ bool intel_report_hub(AttackEntry& e) {
     au["user"]          = e.user;
     au["pass"]          = e.pass;
     au["authenticated"] = e.authenticated;
+    au["attempts"]      = e.auth_attempts;
 
     if (e.pubkeys.length()) {
         // pubkeys field stores one OpenSSH-format line per offered key:

@@ -45,6 +45,7 @@ void AttackEntry::toJson(JsonObject o) const {
     o["pass"]          = pass;
     o["pubkeys"]       = pubkeys;
     o["authenticated"] = authenticated;
+    o["auth_attempts"] = auth_attempts;
     o["commands"]      = commands;
     o["duration_ms"]   = duration_ms;
     o["cast_path"]     = cast_path;
@@ -75,6 +76,7 @@ AttackEntry AttackEntry::fromJson(JsonObjectConst o) {
     e.pass          = (const char*)(o["pass"]          | "");
     e.pubkeys       = (const char*)(o["pubkeys"]       | "");
     e.authenticated = o["authenticated"] | false;
+    e.auth_attempts = o["auth_attempts"] | 0;
     e.commands      = o["commands"]      | 0;
     e.duration_ms   = o["duration_ms"]   | 0;
     e.cast_path     = (const char*)(o["cast_path"]     | "");

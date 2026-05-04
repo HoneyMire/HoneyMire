@@ -17,7 +17,8 @@ struct AttackEntry {
     String   user;
     String   pass;
     String   pubkeys;           // SSH public keys offered by attacker, one per line: "type SHA256:fp base64key"
-    bool     authenticated = false;
+    bool     authenticated = false;  // firmware let them past the configured threshold (hub spec §3.4.2)
+    uint16_t auth_attempts = 0;      // number of credential pairs submitted (drives dashboard "Auth" column)
     uint16_t commands = 0;
     uint32_t duration_ms = 0;
     String   cast_path;         // /sessions/<file>.cast or empty

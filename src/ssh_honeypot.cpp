@@ -306,6 +306,7 @@ static void handle_session(ssh_session sess) {
     entry.pass = last_pass;
     entry.pubkeys = collected_pubkeys;
     entry.authenticated = authed;
+    entry.auth_attempts = (uint16_t)attempts;
 
     ssh_channel chan = nullptr;
     if (authed) {

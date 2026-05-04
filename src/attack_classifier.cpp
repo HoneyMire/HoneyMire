@@ -87,8 +87,8 @@ void classify_attack(AttackEntry& e,
     // 3. No commands at all.
     if (e.commands == 0) {
         if (match_mirai_creds(e.user, e.pass)) { set("scanner", 75); return; }
-        if (e.authenticated) set("creds-only", 60);
-        else                 set("creds-probe", 70);
+        if (e.auth_attempts > 0) set("creds-only", 60);
+        else                     set("creds-probe", 70);
         return;
     }
 
