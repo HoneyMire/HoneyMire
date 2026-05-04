@@ -76,16 +76,41 @@ jobs:
 
           BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           SHORT_SHA=${GIT_SHA::7}
+          VERSION="${GIT_REF}-${SHORT_SHA}"
 
-          # ESP Web Tools manifest with one build entry per chipFamily.
-          # The S3 entry covers both T-QT Pro and N16R8 — we default to the
-          # T-QT Pro image (4 MB, runs on either as long as flash >= 4 MB).
-          # Users who want the full 16 MB N16R8 layout grab firmware-esp32s3-n16r8.bin
-          # from the Releases / Pages site directly.
+          # One ESP Web Tools manifest per concrete board so the picker
+          # cards can flash the right image. The legacy manifest.json is
+          # kept as a chip-family fallback (and it's what /index.html
+          # reads to render version/build_date in the header badges).
+          write_manifest() {
+            local out="$1" img="$2" family="$3"
+            cat > "site/${out}" <<JSON
+          {
+            "name": "HoneyOpus",
+            "version": "${VERSION}",
+            "build_date": "${BUILD_DATE}",
+            "home_assistant_domain": "honeyopus",
+            "new_install_prompt_erase": true,
+            "builds": [
+              {
+                "chipFamily": "${family}",
+                "parts": [
+                  { "path": "${img}", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          JSON
+          }
+          write_manifest manifest-c3.json     firmware-esp32c3.bin         ESP32-C3
+          write_manifest manifest-tqtpro.json firmware-esp32s3-tqtpro.bin  ESP32-S3
+          write_manifest manifest-n16r8.json  firmware-esp32s3-n16r8.bin   ESP32-S3
+
+          # Combined manifest kept for backwards-compat / direct linking.
           cat > site/manifest.json <<JSON
           {
             "name": "HoneyOpus",
-            "version": "${GIT_REF}-${SHORT_SHA}",
+            "version": "${VERSION}",
             "build_date": "${BUILD_DATE}",
             "home_assistant_domain": "honeyopus",
             "new_install_prompt_erase": true,
@@ -126,6 +151,7 @@ jobs:
           path: |
             site/firmware-*.bin
             site/manifest.json
+            site/manifest-*.json
           if-no-files-found: error
           retention-days: 30
 

@@ -4,18 +4,18 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>HoneyOpus · Web Installer</title>
-<meta name="description" content="Flash the HoneyOpus ESP32 honeypot firmware right from your browser. Supports ESP32-C3, LilyGO T-QT Pro and ESP32-S3 N16R8."/>
+<meta name="description" content="Flash the HoneyOpus ESP32 honeypot firmware right from your browser. Supports ESP32-C3 SuperMini, LilyGO T-QT Pro and ESP32-S3 N16R8."/>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext y='52' font-size='52'%3E%F0%9F%8D%AF%3C/text%3E%3C/svg%3E"/>
 <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
 <style>
-:root{--bg:#0e0f13;--fg:#e7e9ee;--mut:#9098a8;--card:#171a21;--acc:#f0b429;--bad:#e94560;--good:#41d693;--bord:#262a35}
+:root{--bg:#0e0f13;--fg:#e7e9ee;--mut:#9098a8;--card:#171a21;--card2:#1d2230;--acc:#f0b429;--bad:#e94560;--good:#41d693;--bord:#262a35;--bord2:#3a4154}
 *{box-sizing:border-box}
 body{margin:0;font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,sans-serif;background:radial-gradient(circle at 30% 0%,#1a1d27 0%,var(--bg) 60%);color:var(--fg);min-height:100vh}
 header{padding:48px 24px 16px;text-align:center}
 header h1{margin:0;font-size:42px;color:var(--acc);letter-spacing:-0.02em}
 header h1 .em{font-size:38px;margin-right:6px}
 header p.tag{margin:8px 0 0;color:var(--mut);font-size:16px}
-main{max-width:760px;margin:0 auto;padding:24px;display:grid;gap:20px}
+main{max-width:920px;margin:0 auto;padding:24px;display:grid;gap:20px}
 .card{background:var(--card);border:1px solid var(--bord);border-radius:12px;padding:24px}
 .card h2{margin:0 0 12px;font-size:18px;color:var(--acc)}
 .card p{margin:6px 0;color:var(--fg)}
@@ -23,8 +23,23 @@ main{max-width:760px;margin:0 auto;padding:24px;display:grid;gap:20px}
 ol{padding-left:22px;margin:8px 0}
 li{margin:4px 0}
 code{background:#0c0d12;border:1px solid var(--bord);padding:1px 6px;border-radius:4px;font:13px ui-monospace,Menlo,monospace}
-.flash{display:flex;flex-direction:column;align-items:center;gap:12px;padding:28px 16px}
+
+/* ---- board picker ---- */
+.boards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:6px 0 18px}
+.board{position:relative;background:var(--card2);border:2px solid var(--bord);border-radius:12px;padding:18px 16px;cursor:pointer;transition:border-color .15s,transform .15s,box-shadow .15s;display:flex;flex-direction:column;gap:8px;text-align:left}
+.board:hover{border-color:var(--bord2);transform:translateY(-1px)}
+.board.selected{border-color:var(--acc);box-shadow:0 0 0 3px rgba(240,180,41,.15)}
+.board .glyph{font-size:34px;line-height:1}
+.board .name{font-size:15px;font-weight:600;color:var(--fg)}
+.board .chip{display:inline-block;background:#0c0d12;border:1px solid var(--bord);padding:2px 8px;border-radius:999px;font-size:11px;color:var(--mut);align-self:flex-start}
+.board .desc{color:var(--mut);font-size:12.5px;margin:0}
+.board .check{position:absolute;top:10px;right:10px;width:22px;height:22px;border-radius:50%;background:var(--acc);color:#0e0f13;font-size:14px;font-weight:700;display:none;align-items:center;justify-content:center}
+.board.selected .check{display:flex}
+
+.flash{display:flex;flex-direction:column;align-items:center;gap:12px;padding:18px 16px}
 esp-web-install-button{--esp-tools-button-color:var(--acc);--esp-tools-button-text-color:#0e0f13;--esp-tools-button-border-radius:8px}
+esp-web-install-button[hidden]{display:none}
+.pick-hint{color:var(--mut);font-size:13.5px;margin:4px 0 0;text-align:center}
 .fallback{display:none;color:var(--bad);font-size:14px;text-align:center;max-width:520px}
 .fallback.show{display:block}
 .badges{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:8px}
@@ -48,14 +63,43 @@ footer a{color:#7ad9ff}
 
 <main>
 
+<section class="card">
+  <h2>1 · Pick your board</h2>
+  <p class="meta">Plug it in via USB, then choose the matching tile. The flasher
+     will use the right partition layout and serial routing for that hardware.</p>
+  <div class="boards" role="radiogroup" aria-label="Target board">
+    <div class="board" data-board="c3" data-manifest="manifest-c3.json" role="radio" tabindex="0" aria-checked="false">
+      <span class="check" aria-hidden="true">✓</span>
+      <span class="glyph">📟</span>
+      <span class="chip">ESP32-C3 · 4 MB</span>
+      <span class="name">ESP32-C3 SuperMini + OLED</span>
+      <p class="desc">01Space SuperMini-class with the built-in 0.42" 72×40
+         monochrome OLED. Cheap, tiny, fine for low traffic.</p>
+    </div>
+    <div class="board" data-board="tqtpro" data-manifest="manifest-tqtpro.json" role="radio" tabindex="0" aria-checked="false">
+      <span class="check" aria-hidden="true">✓</span>
+      <span class="glyph">🖼️</span>
+      <span class="chip">ESP32-S3 · 4 MB · 2 MB PSRAM</span>
+      <span class="name">LilyGO T-QT Pro</span>
+      <p class="desc">Pocket-sized S3 with a 128×128 colour IPS panel and a
+         boot button. Nice live status display while the honeypot runs.</p>
+    </div>
+    <div class="board" data-board="n16r8" data-manifest="manifest-n16r8.json" role="radio" tabindex="0" aria-checked="false">
+      <span class="check" aria-hidden="true">✓</span>
+      <span class="glyph">⚡</span>
+      <span class="chip">ESP32-S3 · 16 MB · 8 MB PSRAM</span>
+      <span class="name">ESP32-S3 N16R8 (headless)</span>
+      <p class="desc">No display, but the most heap and the largest LittleFS
+         (12 MB). Recommended for sustained exposure and high session counts.</p>
+    </div>
+  </div>
+</section>
+
 <section class="card flash">
-  <h2 style="align-self:flex-start">Install the latest firmware</h2>
-  <p class="meta" style="align-self:flex-start;margin-top:-8px">
-    Plug your board in via USB (ESP32-C3 SuperMini, LilyGO T-QT Pro or
-    ESP32-S3 N16R8), then click <b>Connect</b> and pick the serial port.
-    The flasher auto-detects the chip family and picks the matching image.
-  </p>
-  <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+  <h2 style="align-self:flex-start">2 · Flash it</h2>
+  <p class="meta" id="pick-hint" style="align-self:flex-start;margin-top:-8px">
+    Pick a board above first, then click <b>Connect</b> and choose the serial port.</p>
+  <esp-web-install-button id="installer" hidden></esp-web-install-button>
   <div class="fallback" id="fallback">
     Your browser can't talk to USB serial. Use a recent <b>Chrome</b>, <b>Edge</b>
     or <b>Opera</b> on a desktop computer.
@@ -67,7 +111,8 @@ footer a{color:#7ad9ff}
   <p>HoneyOpus is a pocket-sized honeypot that fakes a sloppy Ubuntu server on
      ports 22 and 23. It records every attacker session as an asciinema cast,
      classifies the attack profile (Mirai, IoT loader, manual operator, …),
-     geolocates the source, and can optionally report to AbuseIPDB and AlienVault OTX.</p>
+     geolocates the source, and can optionally report to AbuseIPDB,
+     AlienVault OTX, and a self-hosted HoneyOpus Hub.</p>
 </section>
 
 <section class="card">
@@ -105,6 +150,40 @@ footer a{color:#7ad9ff}
 if (!('serial' in navigator)) {
   document.getElementById('fallback').classList.add('show');
 }
+
+const installer = document.getElementById('installer');
+const hint      = document.getElementById('pick-hint');
+const cards     = document.querySelectorAll('.board');
+
+function pick(card) {
+  cards.forEach(c => {
+    const on = c === card;
+    c.classList.toggle('selected', on);
+    c.setAttribute('aria-checked', on ? 'true' : 'false');
+  });
+  installer.setAttribute('manifest', card.dataset.manifest);
+  installer.hidden = false;
+  hint.innerHTML = 'Selected <b>' + card.querySelector('.name').textContent +
+                   '</b>. Plug the board in and click <b>Connect</b>.';
+  try { localStorage.setItem('honeyopus.board', card.dataset.board); } catch (e) {}
+}
+
+cards.forEach(card => {
+  card.addEventListener('click', () => pick(card));
+  card.addEventListener('keydown', e => {
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); pick(card); }
+  });
+});
+
+// Restore last pick.
+try {
+  const last = localStorage.getItem('honeyopus.board');
+  if (last) {
+    const card = document.querySelector('.board[data-board="' + last + '"]');
+    if (card) pick(card);
+  }
+} catch (e) {}
+
 fetch('manifest.json', {cache:'no-store'}).then(r=>r.json()).then(m=>{
   if (m.version) document.getElementById('b-ver').textContent = m.version;
   if (m.build_date) document.getElementById('b-date').textContent = m.build_date;
