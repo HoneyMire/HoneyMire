@@ -33,8 +33,8 @@ header{padding:14px 18px;border-bottom:1px solid var(--bord);display:flex;justif
 header h1{margin:0;font-size:18px;color:var(--acc)}
 nav a{color:var(--fg);text-decoration:none;margin-left:14px;padding:6px 10px;border-radius:6px}
 nav a.active{background:#222633}
-main{padding:18px;max-width:1100px;margin:0 auto}
-.card{background:var(--card);border:1px solid var(--bord);border-radius:10px;padding:14px;margin-bottom:14px}
+main{padding:18px;max-width:1400px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--bord);border-radius:10px;padding:14px;margin-bottom:14px;overflow-x:auto}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
 .kpi{background:#1c2029;border:1px solid var(--bord);border-radius:8px;padding:10px}
 .kpi b{display:block;font-size:22px;color:var(--acc)}
