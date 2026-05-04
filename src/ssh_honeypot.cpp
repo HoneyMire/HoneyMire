@@ -309,16 +309,42 @@ static void handle_session(ssh_session sess) {
     entry.auth_attempts = (uint16_t)attempts;
 
     ssh_channel chan = nullptr;
+    bool abuse_seen = false;  // attacker tried tunnel/x11/agent/sftp — surfaces in Serial log
     if (authed) {
         // Wait for a session channel — bounded by the global session deadline.
+        // Anything other than SSH_CHANNEL_SESSION is denied. This explicitly
+        // blocks `direct-tcpip` (used by `ssh -L` / dynamic SOCKS tunnels) and
+        // `x11`/`auth-agent` channels at the channel-open layer; libssh's
+        // default reply sends SSH_MSG_CHANNEL_OPEN_FAILURE.
         uint32_t deadline = session_deadline;
         while (!chan && millis() < deadline && ssh_is_connected(sess)) {
             ssh_message msg = ssh_message_get(sess);
             if (!msg) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
-            if (ssh_message_type(msg) == SSH_REQUEST_CHANNEL_OPEN &&
-                ssh_message_subtype(msg) == SSH_CHANNEL_SESSION) {
+            int type = ssh_message_type(msg);
+            int sub  = ssh_message_subtype(msg);
+            if (type == SSH_REQUEST_CHANNEL_OPEN && sub == SSH_CHANNEL_SESSION) {
                 chan = ssh_message_channel_request_open_reply_accept(msg);
             } else {
+                if (type == SSH_REQUEST_CHANNEL_OPEN) {
+                    abuse_seen = true;
+                    const char* what =
+                        (sub == SSH_CHANNEL_DIRECT_TCPIP)    ? "direct-tcpip (-L tunnel)" :
+                        (sub == SSH_CHANNEL_FORWARDED_TCPIP) ? "forwarded-tcpip" :
+                        (sub == SSH_CHANNEL_X11)             ? "x11" :
+                        (sub == SSH_CHANNEL_AUTH_AGENT)      ? "auth-agent" :
+                                                               "unknown";
+                    Serial.printf("[ssh] denied channel-open type=%s ip=%s\n",
+                                  what, entry.ip.c_str());
+                } else if (type == SSH_REQUEST_GLOBAL) {
+                    // tcpip-forward (-R reverse tunnel) lives here.
+                    abuse_seen = true;
+                    const char* what =
+                        (sub == SSH_GLOBAL_REQUEST_TCPIP_FORWARD)        ? "tcpip-forward (-R tunnel)" :
+                        (sub == SSH_GLOBAL_REQUEST_CANCEL_TCPIP_FORWARD) ? "cancel-tcpip-forward" :
+                                                                           "global";
+                    Serial.printf("[ssh] denied global request=%s ip=%s\n",
+                                  what, entry.ip.c_str());
+                }
                 ssh_message_reply_default(msg);
             }
             ssh_message_free(msg);
@@ -341,16 +367,40 @@ static void handle_session(ssh_session sess) {
                     ready = true;
                 } else if (sub == SSH_CHANNEL_REQUEST_EXEC) {
                     const char* c = ssh_message_channel_request_command(msg);
-                    if (c) exec_cmd = c;
+                    if (c) {
+                        // Cap defensively — fake_shell bounds command length to 4096
+                        // and an unbounded exec string would just inflate heap.
+                        size_t n = strlen(c);
+                        if (n > 4096) n = 4096;
+                        exec_cmd = String();
+                        exec_cmd.reserve(n);
+                        for (size_t i = 0; i < n; ++i) exec_cmd += c[i];
+                    }
                     ssh_message_channel_request_reply_success(msg);
                     ready = true;
                     exec_run = true;
                 } else if (sub == SSH_CHANNEL_REQUEST_ENV) {
+                    // Accepted but ignored — lets `ssh -o SendEnv=...` succeed
+                    // without giving the attacker any real influence.
                     ssh_message_channel_request_reply_success(msg);
                 } else {
+                    // Explicitly denies subsystem (sftp/netconf), x11-req,
+                    // auth-agent-req@openssh.com, signal, window-change, etc.
+                    abuse_seen = true;
+                    const char* what =
+                        (sub == SSH_CHANNEL_REQUEST_SUBSYSTEM) ? "subsystem (sftp?)" :
+                        (sub == SSH_CHANNEL_REQUEST_X11)       ? "x11-req" :
+                                                                 "unknown channel-req";
+                    Serial.printf("[ssh] denied channel-req=%s ip=%s\n",
+                                  what, entry.ip.c_str());
                     ssh_message_reply_default(msg);
                 }
             } else {
+                if (type == SSH_REQUEST_GLOBAL) {
+                    abuse_seen = true;
+                    Serial.printf("[ssh] denied late global-req sub=%d ip=%s\n",
+                                  sub, entry.ip.c_str());
+                }
                 ssh_message_reply_default(msg);
             }
             ssh_message_free(msg);
@@ -393,10 +443,11 @@ static void handle_session(ssh_session sess) {
         storage_enforce_session_quota(c.max_sessions, (size_t)c.max_session_dir_kb * 1024);
     }
 
-    Serial.printf("[ssh] session done id=%u ip=%s user=%s pass=%s authed=%d cmds=%u\n",
+    Serial.printf("[ssh] session done id=%u ip=%s user=%s pass=%s authed=%d cmds=%u%s\n",
                   (unsigned)entry.id, entry.ip.c_str(),
                   entry.user.c_str(), entry.pass.c_str(),
-                  (int)entry.authenticated, entry.commands);
+                  (int)entry.authenticated, entry.commands,
+                  abuse_seen ? " ABUSE_DENIED" : "");
 }
 
 static void ssh_listener_task(void*) {
