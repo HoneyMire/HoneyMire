@@ -112,6 +112,7 @@ private:
 
     // ---------- commands ----------
     String cmdEcho_(Cmd& c);
+    String cmdPrintf_(Cmd& c);
     String cmdLs_(Cmd& c);
     String cmdCd_(Cmd& c);
     String cmdCat_(Cmd& c);

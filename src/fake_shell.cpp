@@ -326,7 +326,20 @@ static void tokenize(const String& src, std::vector<String>& out) {
     bool have=false;
     for (size_t i=0;i<src.length();++i) {
         char c = src[i];
-        if (!inS && c=='\\' && i+1<src.length()) { cur+=src[i+1]; ++i; have=true; continue; }
+        if (!inS && !inD && c=='\\' && i+1<src.length()) {
+            // Outside quotes: backslash escapes the next char literally.
+            cur+=src[i+1]; ++i; have=true; continue;
+        }
+        if (inD && c=='\\' && i+1<src.length()) {
+            // Inside double quotes, bash only recognises \" \\ \$ \` \newline.
+            // Every other backslash sequence is preserved verbatim — including
+            // \x.., \n, \t etc., which are then re-interpreted by `echo -e`.
+            char n = src[i+1];
+            if (n=='"' || n=='\\' || n=='$' || n=='`' || n=='\n') {
+                cur+=n; ++i; have=true; continue;
+            }
+            // Fall through: keep the backslash literal.
+        }
         if (!inS && c=='"') { inD=!inD; have=true; continue; }
         if (!inD && c=='\'') { inS=!inS; have=true; continue; }
         if (!inS && !inD && (c==' '||c=='\t')) {
@@ -800,6 +813,7 @@ String FakeShell::runOne_(Cmd& c) {
 
     if (e=="exit"||e=="logout"||e=="quit") { exit_=true; return ""; }
     if (e=="echo") return cmdEcho_(c);
+    if (e=="printf") return cmdPrintf_(c);
     if (e=="ls"||e=="dir") return cmdLs_(c);
     if (e=="cd") return cmdCd_(c);
     if (e=="pwd") return cwd_+"\n";
@@ -907,16 +921,224 @@ String FakeShell::runOne_(Cmd& c) {
 // ===================== individual commands =====================
 
 String FakeShell::cmdEcho_(Cmd& c) {
-    bool n=false; size_t i=1;
+    bool n=false; bool e=false; size_t i=1;
     while (i<c.argv.size() && c.argv[i].length()>1 && c.argv[i][0]=='-') {
-        if (c.argv[i]=="-n") { n=true; ++i; continue; }
-        if (c.argv[i]=="-e"||c.argv[i]=="-E") { ++i; continue; }
-        break;
+        // Real bash echo only recognises a *combination* of n/e/E in one flag;
+        // any other char makes the whole token a literal. Good enough.
+        const String& f = c.argv[i];
+        bool ok = true;
+        bool nn=false, ee=false, EE=false;
+        for (size_t k=1;k<f.length();++k) {
+            if (f[k]=='n') nn=true;
+            else if (f[k]=='e') ee=true;
+            else if (f[k]=='E') EE=true;
+            else { ok=false; break; }
+        }
+        if (!ok) break;
+        if (nn) n=true;
+        if (ee) e=true;
+        if (EE) e=false;
+        ++i;
     }
     String r;
-    for (size_t j=i;j<c.argv.size();++j) { if (j>i) r+=' '; r+=c.argv[j]; }
+    auto interp = [](const String& in, String& out, bool& stop) {
+        for (size_t k=0;k<in.length();++k) {
+            char ch = in[k];
+            if (ch != '\\' || k+1 >= in.length()) { out += ch; continue; }
+            char nx = in[k+1];
+            switch (nx) {
+                case 'a': out += '\a'; k++; break;
+                case 'b': out += '\b'; k++; break;
+                case 'e': out += '\x1b'; k++; break;
+                case 'f': out += '\f'; k++; break;
+                case 'n': out += '\n'; k++; break;
+                case 'r': out += '\r'; k++; break;
+                case 't': out += '\t'; k++; break;
+                case 'v': out += '\v'; k++; break;
+                case '\\': out += '\\'; k++; break;
+                case '0': {
+                    // \0NNN — up to 3 octal digits after the literal '0'.
+                    k++;
+                    int v = 0, d = 0;
+                    while (d < 3 && k+1 < in.length() &&
+                           in[k+1] >= '0' && in[k+1] <= '7') {
+                        v = v*8 + (in[k+1]-'0'); ++k; ++d;
+                    }
+                    out += (char)(v & 0xff);
+                    break;
+                }
+                case 'x': {
+                    // \xHH — 1 or 2 hex digits.
+                    auto hex = [](char x)->int{
+                        if (x>='0'&&x<='9') return x-'0';
+                        if (x>='a'&&x<='f') return x-'a'+10;
+                        if (x>='A'&&x<='F') return x-'A'+10;
+                        return -1;
+                    };
+                    if (k+2 < in.length() && hex(in[k+2]) >= 0) {
+                        int v = hex(in[k+2]);
+                        k += 2;
+                        if (k+1 < in.length() && hex(in[k+1]) >= 0) {
+                            v = v*16 + hex(in[k+1]); ++k;
+                        }
+                        out += (char)(v & 0xff);
+                    } else {
+                        out += '\\'; out += 'x'; ++k;
+                    }
+                    break;
+                }
+                case 'c':
+                    // \c — suppress trailing newline and stop processing.
+                    stop = true;
+                    return;
+                default:
+                    out += '\\'; out += nx; ++k; break;
+            }
+        }
+    };
+    bool stop = false;
+    for (size_t j=i;j<c.argv.size();++j) {
+        if (j>i) r+=' ';
+        if (e) {
+            String piece;
+            interp(c.argv[j], piece, stop);
+            r += piece;
+            if (stop) { n = true; break; }
+        } else {
+            r += c.argv[j];
+        }
+    }
     if (!n) r+='\n';
     return r;
+}
+
+// Minimal `printf` — handles backslash escapes (\xHH, \NNN, \n, \t, \r, \\ ...)
+// in the format string, and the most common conversions (%s %d %i %x %X %o %c
+// %% %b). Argument list is recycled if more conversions than args, matching
+// real bash printf semantics. No newline is appended automatically — that's
+// what the format string is for.
+String FakeShell::cmdPrintf_(Cmd& c) {
+    if (c.argv.size() < 2) return "";
+    auto hex = [](char x)->int{
+        if (x>='0'&&x<='9') return x-'0';
+        if (x>='a'&&x<='f') return x-'a'+10;
+        if (x>='A'&&x<='F') return x-'A'+10;
+        return -1;
+    };
+    auto interpEsc = [&](const String& in, String& out) {
+        for (size_t k=0;k<in.length();++k) {
+            char ch = in[k];
+            if (ch != '\\' || k+1 >= in.length()) { out += ch; continue; }
+            char nx = in[k+1];
+            switch (nx) {
+                case 'a': out += '\a'; ++k; break;
+                case 'b': out += '\b'; ++k; break;
+                case 'e': out += '\x1b'; ++k; break;
+                case 'f': out += '\f'; ++k; break;
+                case 'n': out += '\n'; ++k; break;
+                case 'r': out += '\r'; ++k; break;
+                case 't': out += '\t'; ++k; break;
+                case 'v': out += '\v'; ++k; break;
+                case '\\': out += '\\'; ++k; break;
+                case '"': out += '"'; ++k; break;
+                case '\'': out += '\''; ++k; break;
+                case 'x': {
+                    if (k+2 < in.length() && hex(in[k+2]) >= 0) {
+                        int v = hex(in[k+2]); k += 2;
+                        if (k+1 < in.length() && hex(in[k+1]) >= 0) {
+                            v = v*16 + hex(in[k+1]); ++k;
+                        }
+                        out += (char)(v & 0xff);
+                    } else { out += '\\'; out += 'x'; ++k; }
+                    break;
+                }
+                default:
+                    if (nx >= '0' && nx <= '7') {
+                        int v = 0, d = 0;
+                        while (d < 3 && k+1 < in.length() &&
+                               in[k+1] >= '0' && in[k+1] <= '7') {
+                            v = v*8 + (in[k+1]-'0'); ++k; ++d;
+                        }
+                        out += (char)(v & 0xff);
+                    } else {
+                        out += '\\'; out += nx; ++k;
+                    }
+                    break;
+            }
+        }
+    };
+
+    const String& fmt = c.argv[1];
+    size_t arg = 2;
+    String out;
+    bool consumed_any = false;
+
+    // printf cycles the format string until all args are consumed, with at
+    // least one pass.
+    do {
+        consumed_any = false;
+        for (size_t k=0;k<fmt.length();++k) {
+            char ch = fmt[k];
+            if (ch == '\\' && k+1 < fmt.length()) {
+                String tmp; tmp += ch; tmp += fmt[k+1];
+                size_t before = out.length();
+                interpEsc(tmp, out);
+                if (out.length() != before+2) ++k;  // consumed escape
+                continue;
+            }
+            if (ch != '%') { out += ch; continue; }
+            // Format spec: %[flags][width][.prec]conv
+            size_t s = k+1;
+            // Skip flags / width / precision — we ignore them but must advance.
+            while (s < fmt.length() && (fmt[s]=='-'||fmt[s]=='+'||fmt[s]==' '||
+                                        fmt[s]=='#'||fmt[s]=='0')) ++s;
+            while (s < fmt.length() && fmt[s] >= '0' && fmt[s] <= '9') ++s;
+            if (s < fmt.length() && fmt[s]=='.') {
+                ++s;
+                while (s < fmt.length() && fmt[s] >= '0' && fmt[s] <= '9') ++s;
+            }
+            if (s >= fmt.length()) { out += '%'; continue; }
+            char conv = fmt[s];
+            const String& a = (arg < c.argv.size()) ? c.argv[arg] : String("");
+            switch (conv) {
+                case '%': out += '%'; break;
+                case 's': out += a; if (arg<c.argv.size()){++arg;consumed_any=true;} break;
+                case 'b': {
+                    String tmp; interpEsc(a, tmp); out += tmp;
+                    if (arg<c.argv.size()){++arg;consumed_any=true;}
+                    break;
+                }
+                case 'c':
+                    if (a.length()) out += a[0];
+                    if (arg<c.argv.size()){++arg;consumed_any=true;}
+                    break;
+                case 'd': case 'i': {
+                    long v = a.toInt();
+                    out += String(v);
+                    if (arg<c.argv.size()){++arg;consumed_any=true;}
+                    break;
+                }
+                case 'u': case 'x': case 'X': case 'o': {
+                    unsigned long v = (unsigned long)a.toInt();
+                    char buf[24];
+                    const char* sp = (conv=='x') ? "%lx" :
+                                     (conv=='X') ? "%lX" :
+                                     (conv=='o') ? "%lo" : "%lu";
+                    snprintf(buf, sizeof(buf), sp, v);
+                    out += buf;
+                    if (arg<c.argv.size()){++arg;consumed_any=true;}
+                    break;
+                }
+                default:
+                    // Unknown conversion: emit literally.
+                    for (size_t q=k;q<=s;++q) out += fmt[q];
+                    break;
+            }
+            k = s;
+        }
+    } while (arg < c.argv.size() && consumed_any);
+
+    return out;
 }
 
 String FakeShell::cmdLs_(Cmd& c) {
@@ -1963,7 +2185,7 @@ String FakeShell::cmdWhich_(Cmd& c) {
     String r;
     for (size_t i=1;i<c.argv.size();++i) {
         const String& n = c.argv[i];
-        if (n=="ls"||n=="cat"||n=="echo"||n=="rm"||n=="cp"||n=="mv"||n=="chmod"||
+        if (n=="ls"||n=="cat"||n=="echo"||n=="printf"||n=="rm"||n=="cp"||n=="mv"||n=="chmod"||
             n=="bash"||n=="sh"||n=="ps"||n=="grep"||n=="head"||n=="tail")
             r += "/bin/"+n+"\n";
         else if (n=="wget"||n=="curl"||n=="python"||n=="python3"||n=="perl"||n=="php"||
