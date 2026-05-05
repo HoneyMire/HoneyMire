@@ -1,5 +1,6 @@
 #include "telnet_honeypot.h"
 #include "config.h"
+#include "telnet_persona.h"
 #include "fake_shell.h"
 #include "asciinema.h"
 #include "attack_log.h"
@@ -81,6 +82,7 @@ struct TnSession {
     AttackEntry  entry;
     Asciinema    cast;
     FakeShell    shell;
+    TelnetPersona persona = TelnetPersona::Ubuntu;
 
     enum Phase { P_USER, P_PASS, P_SHELL, P_DEAD };
     Phase    phase = P_USER;
@@ -138,8 +140,14 @@ static void tn_send_iac_neg(TnSession* s) {
 }
 
 static void tn_prompt_login(TnSession* s) {
-    String banner = String(g_config.get().telnet_banner) + "\r\n" +
-                    g_config.get().fake_hostname + " login: ";
+    const auto& profile = telnet_persona_profile(s->persona);
+    String banner;
+    if (profile.banner) {
+        banner = String(profile.banner) + "\r\n";
+    }
+    char prompt[128];
+    snprintf(prompt, sizeof(prompt), profile.login_prompt, profile.hostname);
+    banner += prompt;
     tn_send(s, banner);
     s->phase = TnSession::P_USER;
     s->line_buf = "";
@@ -169,15 +177,20 @@ static void tn_handle_complete_line(TnSession* s) {
         if (s->attempts >= cfg.login_attempts_before_accept) {
             s->entry.authenticated = true;
             s->phase = TnSession::P_SHELL;
-            s->shell.begin(s->pending_user.length() ? s->pending_user : String(cfg.fake_user),
-                           cfg.fake_hostname);
+            const auto& profile = telnet_persona_profile(s->persona);
+            s->shell.begin(s->pending_user.length() ? s->pending_user : String(profile.fake_user),
+                           profile.hostname);
+            s->shell.setPersona(s->persona);
             s->shell.setSessionInfo(s->entry.id, s->entry.ip, s->entry.port,
                                     "telnet", s->entry.cast_path + ".events.jsonl");
             tn_send(s, s->shell.motd());
             tn_send(s, s->shell.prompt());
         } else {
             tn_send(s, "\r\nLogin incorrect\r\n");
-            tn_send(s, cfg.fake_hostname + " login: ");
+            const auto& profile = telnet_persona_profile(s->persona);
+            char prompt[128];
+            snprintf(prompt, sizeof(prompt), profile.login_prompt, profile.hostname);
+            tn_send(s, prompt);
             s->phase = TnSession::P_USER;
         }
         return;
@@ -379,6 +392,7 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     s->client = c;
     s->t0 = millis();
     s->last_rx_ms = s->t0;
+    s->persona = telnet_persona_random();  // Select random persona per connection
     registry_add(s);
     s->entry.id        = g_attack_log.nextId();
     s->entry.ts        = time(nullptr);

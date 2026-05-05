@@ -1,4 +1,5 @@
 #include "fake_shell.h"
+#include "telnet_persona.h"
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -277,31 +278,104 @@ void FakeShell::setSessionInfo(uint32_t session_id, const String& source_ip,
     proto_=protocol; events_path_=events_path;
 }
 
+void FakeShell::setPersona(TelnetPersona p) {
+    persona_ = p;
+}
+
 String FakeShell::motd() const {
     String s;
-    s += "Welcome to Ubuntu 18.04.6 LTS (GNU/Linux 4.15.0-142-generic x86_64)\r\n\r\n";
-    s += " * Documentation:  https://help.ubuntu.com\r\n";
-    s += " * Management:     https://landscape.canonical.com\r\n";
-    s += " * Support:        https://ubuntu.com/advantage\r\n\r\n";
-    s += "  System information as of " + String(millis()/1000) + "\r\n\r\n";
-    s += "  System load:  0.08              Processes:           98\r\n";
-    s += "  Usage of /:   23.4% of 19.56GB  Users logged in:     0\r\n";
-    s += "  Memory usage: 28%               IP address for eth0: 10.0.0.42\r\n";
-    s += "  Swap usage:   0%\r\n\r\n";
-    s += "0 packages can be updated.\r\n";
-    s += "0 updates are security updates.\r\n\r\n";
-    s += "Last login: Mon Sep  4 09:14:21 2023 from 192.168.1.5\r\n";
+    switch (persona_) {
+        case TelnetPersona::Ubuntu:
+            s += "Welcome to Ubuntu 18.04.6 LTS (GNU/Linux 4.15.0-142-generic x86_64)\r\n\r\n";
+            s += " * Documentation:  https://help.ubuntu.com\r\n";
+            s += " * Management:     https://landscape.canonical.com\r\n";
+            s += " * Support:        https://ubuntu.com/advantage\r\n\r\n";
+            s += "  System information as of " + String(millis()/1000) + "\r\n\r\n";
+            s += "  System load:  0.08              Processes:           98\r\n";
+            s += "  Usage of /:   23.4% of 19.56GB  Users logged in:     0\r\n";
+            s += "  Memory usage: 28%               IP address for eth0: 10.0.0.42\r\n";
+            s += "  Swap usage:   0%\r\n\r\n";
+            s += "0 packages can be updated.\r\n";
+            s += "0 updates are security updates.\r\n\r\n";
+            s += "Last login: Mon Sep  4 09:14:21 2023 from 192.168.1.5\r\n";
+            break;
+        case TelnetPersona::BusyBox:
+            s += "BusyBox v1.35.0 (2022-12-01) built-in shell (ash)\r\n";
+            s += "Enter 'help' for a list of built-in commands.\r\n\r\n";
+            break;
+        case TelnetPersona::RouterOS:
+            // RouterOS does not show MOTD on login, just the prompt
+            break;
+        case TelnetPersona::OpenWrt:
+            s += "OpenWrt BARRIER BREAKER 14.07 r42625\r\n\r\n";
+            s += "  _______                     ________        __\r\n";
+            s += " |       |.-----.-----.-----.|  |  |  |.----.|  |\r\n";
+            s += " |   -   ||  _  |  -__|     ||  |  |  ||   _||  |\r\n";
+            s += " |_______||   __|_____|__|__||________||__|  |__|\r\n";
+            s += " |  _  | |  |  W I R E L E S S    F R E E D O M\r\n";
+            s += " | | | | |  |  BARRIER BREAKER (14.07, r42625)\r\n";
+            s += " |_|_|_|_|__|_|_____________________________\r\n\r\n";
+            break;
+        case TelnetPersona::DVRDVS:
+            s += "DVRDVS DVR System\r\n";
+            s += "Type ? for help\r\n\r\n";
+            break;
+        case TelnetPersona::HiLinux:
+            // HiLinux typically shows minimal banners
+            s += "Welcome to HiLinux (NVR Box)\r\n\r\n";
+            break;
+        default:
+            s += "Welcome to the system.\r\n";
+            break;
+    }
     return s;
 }
 
 String FakeShell::prompt() const {
-    String p = user_ + "@" + host_ + ":";
-    String c = cwd_;
-    String home = (user_=="root") ? "/root" : ("/home/"+user_);
-    if (c == home) p += "~";
-    else if (c.startsWith(home+"/")) p += "~"+c.substring(home.length());
-    else p += c;
-    p += (user_=="root") ? "# " : "$ ";
+    String p;
+    switch (persona_) {
+        case TelnetPersona::RouterOS:
+            // RouterOS uses [hostname] > format
+            p = "[" + host_ + "] > ";
+            break;
+        case TelnetPersona::BusyBox:
+        case TelnetPersona::OpenWrt:
+            // BusyBox/OpenWrt use # for root, $ for others
+            if (user_ == "root" || user_ == "admin") {
+                p = host_ + ":";
+                String c = cwd_;
+                String home = "/root";
+                if (c == home) p += "~";
+                else if (c.startsWith(home+"/")) p += "~"+c.substring(home.length());
+                else p += c;
+                p += "# ";
+            } else {
+                p = host_ + ":";
+                String c = cwd_;
+                String home = "/home/"+user_;
+                if (c == home) p += "~";
+                else if (c.startsWith(home+"/")) p += "~"+c.substring(home.length());
+                else p += c;
+                p += "$ ";
+            }
+            break;
+        case TelnetPersona::DVRDVS:
+            p = "dvrdvs> ";
+            break;
+        case TelnetPersona::HiLinux:
+            p = host_ + "# ";
+            break;
+        case TelnetPersona::Ubuntu:
+        default:
+            p = user_ + "@" + host_ + ":";
+            String c = cwd_;
+            String home = (user_=="root") ? "/root" : ("/home/"+user_);
+            if (c == home) p += "~";
+            else if (c.startsWith(home+"/")) p += "~"+c.substring(home.length());
+            else p += c;
+            p += (user_=="root") ? "# " : "$ ";
+            break;
+    }
     return p;
 }
 

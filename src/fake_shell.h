@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <vector>
+#include "telnet_persona.h"
 
 namespace honeyopus {
 
@@ -44,6 +45,7 @@ struct FakeProcess {
 class FakeShell {
 public:
     void begin(const String& user, const String& host);
+    void setPersona(TelnetPersona p);  // Set the server persona
 
     // Optional session metadata; safe to call any time before execute(). When
     // events_path is non-empty, structured per-command events are appended as
@@ -188,6 +190,7 @@ private:
     String user_;
     String host_;
     String cwd_ = "/root";
+    TelnetPersona persona_ = TelnetPersona::Ubuntu;
     uint16_t commands_ = 0;
     bool     exit_ = false;
     bool     cap_hit_ = false;
