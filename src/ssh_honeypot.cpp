@@ -35,13 +35,14 @@ namespace honeyopus {
 // inside libssh return EAGAIN promptly so our wall-clock deadline checks
 // can actually fire.
 static const int      kSshSocketTimeoutSec = 5;
-// Hard ceiling on a single SSH session's wall-clock duration. Bots and
-// dropper scripts complete the entire authenticate-and-run-payload
-// sequence in well under a second; anything slower than this is either a
-// human poking around (not what we're here for) or a slow-loris attack.
-// We'd rather drop the connection and free the ~100 KB libssh footprint
-// for the next attacker than fingerprint a bored human.
-static const uint32_t kSshMaxSessionMs    = 15000;
+// Idle timeout: drop the session after this much wall-clock with no
+// attacker activity. The clock RESETS on every received SSH message and
+// on every byte read inside the fake shell, so a bot or human that's
+// actively poking around keeps the session alive indefinitely. Only true
+// silence (slow-loris, dead TCP, attacker walked away) trips it. We'd
+// rather drop a quiet socket and free the ~100 KB libssh footprint for
+// the next attacker than hold the slot open for a peer who's gone.
+static const uint32_t kSshIdleTimeoutMs   = 15000;
 
 // LittleFS in Arduino-ESP32 mounts at the VFS base "/littlefs". libssh fopen()s
 // from this VFS path; the Arduino LittleFS API uses paths *without* the prefix.
@@ -118,8 +119,7 @@ static void chan_write(ssh_channel chan, Asciinema& cast, const String& s) {
     chan_write(chan, cast, s.c_str(), s.length());
 }
 
-static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entry, Asciinema& cast,
-                           uint32_t session_deadline) {
+static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entry, Asciinema& cast) {
     auto& cfg = g_config.get();
     FakeShell shell;
     shell.begin(entry.user.length() ? entry.user : String(cfg.fake_user), cfg.fake_hostname);
@@ -130,15 +130,19 @@ static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entr
 
     String line;
     char buf[128];
+    // Idle timer: reset on every byte the attacker sends. An actively
+    // typing session lives indefinitely; only true silence trips the cap.
+    uint32_t last_activity_ms = millis();
     while (!shell.exitRequested() && !shell.sessionLimitsExceeded() &&
            ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan) &&
-           millis() < session_deadline) {
+           (millis() - last_activity_ms) < kSshIdleTimeoutMs) {
         int n = ssh_channel_read_nonblocking(chan, buf, sizeof(buf), 0);
         if (n == SSH_ERROR) break;
         if (n == 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        last_activity_ms = millis();
         cast.in(buf, n);
         for (int i = 0; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
@@ -225,11 +229,18 @@ static void handle_session(ssh_session sess) {
     int attempts = 0;
     String last_user, last_pass;
     String collected_pubkeys;
-    const uint32_t session_deadline = t0 + kSshMaxSessionMs;
+    // Idle timer: reset on every SSH message we receive from the peer.
+    // An actively-typing attacker keeps last_activity_ms fresh and is
+    // never closed for "session too long".
+    uint32_t last_activity_ms = millis();
+    auto idle_alive = [&]() {
+        return (millis() - last_activity_ms) < kSshIdleTimeoutMs;
+    };
     while (!authed && attempts < cfg.login_attempts_before_accept + 5 &&
-           ssh_is_connected(sess) && millis() < session_deadline) {
+           ssh_is_connected(sess) && idle_alive()) {
         ssh_message msg = ssh_message_get(sess);
         if (!msg) break;
+        last_activity_ms = millis();
         int type = ssh_message_type(msg);
         int sub  = ssh_message_subtype(msg);
         if (type == SSH_REQUEST_AUTH) {
@@ -311,15 +322,17 @@ static void handle_session(ssh_session sess) {
     ssh_channel chan = nullptr;
     bool abuse_seen = false;  // attacker tried tunnel/x11/agent/sftp — surfaces in Serial log
     if (authed) {
-        // Wait for a session channel — bounded by the global session deadline.
-        // Anything other than SSH_CHANNEL_SESSION is denied. This explicitly
-        // blocks `direct-tcpip` (used by `ssh -L` / dynamic SOCKS tunnels) and
-        // `x11`/`auth-agent` channels at the channel-open layer; libssh's
-        // default reply sends SSH_MSG_CHANNEL_OPEN_FAILURE.
-        uint32_t deadline = session_deadline;
-        while (!chan && millis() < deadline && ssh_is_connected(sess)) {
+        // Wait for a session channel — bounded by the idle timer (resets
+        // on each message received). Anything other than SSH_CHANNEL_SESSION
+        // is denied. This explicitly blocks `direct-tcpip` (used by `ssh -L`
+        // / dynamic SOCKS tunnels) and `x11`/`auth-agent` channels at the
+        // channel-open layer; libssh's default reply sends
+        // SSH_MSG_CHANNEL_OPEN_FAILURE.
+        last_activity_ms = millis();
+        while (!chan && idle_alive() && ssh_is_connected(sess)) {
             ssh_message msg = ssh_message_get(sess);
             if (!msg) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+            last_activity_ms = millis();
             int type = ssh_message_type(msg);
             int sub  = ssh_message_subtype(msg);
             if (type == SSH_REQUEST_CHANNEL_OPEN && sub == SSH_CHANNEL_SESSION) {
@@ -353,10 +366,11 @@ static void handle_session(ssh_session sess) {
         bool ready = false;
         bool exec_run = false;
         String exec_cmd;
-        deadline = session_deadline;
-        while (chan && !ready && millis() < deadline && ssh_is_connected(sess)) {
+        last_activity_ms = millis();
+        while (chan && !ready && idle_alive() && ssh_is_connected(sess)) {
             ssh_message msg = ssh_message_get(sess);
             if (!msg) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+            last_activity_ms = millis();
             int type = ssh_message_type(msg);
             int sub  = ssh_message_subtype(msg);
             if (type == SSH_REQUEST_CHANNEL) {
@@ -418,7 +432,7 @@ static void handle_session(ssh_session sess) {
                 entry.commands = 1;
                 classify_attack(entry, exec_cmd, millis(), millis());
             } else {
-                run_fake_shell(sess, chan, entry, cast, session_deadline);
+                run_fake_shell(sess, chan, entry, cast);
             }
             ssh_channel_send_eof(chan);
             ssh_channel_close(chan);

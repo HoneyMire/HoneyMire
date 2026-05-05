@@ -90,6 +90,8 @@ struct TnSession {
     bool     iac_skip = false; // gobbling 1 byte after IAC cmd
     int      iac_state = 0;    // 0=normal,1=after IAC,2=after IAC+cmd,3=in subneg
     uint32_t t0 = 0;
+    uint32_t last_rx_ms = 0;   // millis() of the most recent inbound packet
+                               // — drives the idle-timeout / reaper.
     bool     finalized = false;
     bool     stuck_logged = false; // set once when reaper first reports leak
     uint32_t stuck_at_ms = 0;      // millis() when stuck was first detected
@@ -246,6 +248,11 @@ static void tn_finalize(TnSession* s) {
 static void tn_on_data(void* arg, AsyncClient* /*c*/, void* data, size_t len) {
     auto* s = (TnSession*)arg;
     if (!s || s->phase == TnSession::P_DEAD) return;
+    // Reset the idle timer on every received packet — even IAC noise counts
+    // as the attacker still being on the line. tn_on_poll / telnet_reap
+    // compare last_rx_ms (not t0) so an actively-typing session is never
+    // closed for "session too long".
+    s->last_rx_ms = millis();
     const uint8_t* p = (const uint8_t*)data;
 
     // Don't bulk-record the raw input: it includes the attacker's IAC
@@ -334,8 +341,12 @@ static void tn_on_timeout(void* arg, AsyncClient* c, uint32_t /*time*/) {
 static void tn_on_poll(void* arg, AsyncClient* c) {
     auto* s = (TnSession*)arg;
     if (!s || !c || s->finalized) return;
-    constexpr uint32_t kTnMaxSessionMs = 15000;
-    if (millis() - s->t0 > kTnMaxSessionMs) {
+    // Idle timeout — only close if the attacker has stopped sending bytes
+    // for the full window. Resets on every onData (see tn_on_data). An
+    // actively-typing session lives for as long as the attacker keeps
+    // sending; only true silence closes it.
+    constexpr uint32_t kTnIdleTimeoutMs = 15000;
+    if (millis() - s->last_rx_ms > kTnIdleTimeoutMs) {
         c->close();
     }
 }
@@ -367,6 +378,7 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     auto* s = new TnSession();
     s->client = c;
     s->t0 = millis();
+    s->last_rx_ms = s->t0;
     registry_add(s);
     s->entry.id        = g_attack_log.nextId();
     s->entry.ts        = time(nullptr);
@@ -410,15 +422,17 @@ void telnet_begin() {
 }
 
 void telnet_reap() {
-    // Phase 1: 15 s after t0, mark the session "stuck" and ask AsyncTCP to
-    //          close it. The v3 lwIP-rcv-window patch makes close() from
-    //          the main loop safe again; before that, calling close() here
-    //          could panic the device.
+    // Phase 1: 15 s after the last received byte, mark the session "stuck"
+    //          and ask AsyncTCP to close it. Idle-based — an actively
+    //          typing attacker keeps last_rx_ms fresh and is left alone.
+    //          The v3 lwIP-rcv-window patch makes close() from the main
+    //          loop safe again; before that, calling close() here could
+    //          panic the device.
     // Phase 2: if 30 s after the close attempt the slot is still occupied,
     //          we've truly leaked it. Better to spend a clean reboot than
     //          to limp along with reduced capacity (and possibly all 3
     //          slots gone — at which point Telnet is fully dead anyway).
-    constexpr uint32_t kTnMaxSessionMs   = 15000;
+    constexpr uint32_t kTnIdleTimeoutMs  = 15000;
     constexpr uint32_t kTnRebootAfterMs  = 30000;
     uint32_t now = millis();
 
@@ -432,7 +446,7 @@ void telnet_reap() {
     portENTER_CRITICAL(&s_reg_mux);
     for (auto& slot : s_registry) {
         if (!slot || slot->finalized) continue;
-        if ((now - slot->t0) <= kTnMaxSessionMs) continue;
+        if ((now - slot->last_rx_ms) <= kTnIdleTimeoutMs) continue;
         if (!slot->stuck_logged) {
             slot->stuck_logged   = true;
             slot->stuck_at_ms    = now;
@@ -453,8 +467,8 @@ void telnet_reap() {
     // Log once per stuck session — re-logging every 1 Hz pass floods Serial
     // and can re-introduce the HWCDC-TX-saturation deadlock we just fixed.
     for (size_t i = 0; i < log_n; ++i) {
-        Serial.printf("[telnet] reaper: session id=%u stuck (>%us), closing\n",
-                      (unsigned)log_vids[i], (unsigned)(kTnMaxSessionMs / 1000));
+        Serial.printf("[telnet] reaper: session id=%u idle >%us, closing\n",
+                      (unsigned)log_vids[i], (unsigned)(kTnIdleTimeoutMs / 1000));
     }
     // Best-effort close. AsyncTCP marshals close onto the tcpip thread, so
     // the call itself is thread-safe; the v3 patch guarantees the
