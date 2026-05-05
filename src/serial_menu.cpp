@@ -241,9 +241,10 @@ void serial_menu_loop() {
     uint32_t now = millis();
     if (!s_seen_input && (now - s_last_hb) > 10000) {
         s_last_hb = now;
-        Serial.printf(
-            "\r\n[serial_menu] alive state=%d avail=%d  (press 'm' or Enter to open menu)\r\n",
-            (int)s_state, Serial.available());
+        // Disabled debug: was too verbose
+        // Serial.printf(
+        //     "\r\n[serial_menu] alive state=%d avail=%d  (press 'm' or Enter to open menu)\r\n",
+        //     (int)s_state, Serial.available());
     }
 
     while (Serial.available() > 0) {
