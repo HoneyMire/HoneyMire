@@ -1,6 +1,7 @@
 #include "intel.h"
 #include "config.h"
 #include "geoip.h"
+#include "dshield_reporter.h"
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -795,9 +796,20 @@ bool intel_report_hub(AttackEntry& e) {
     return false;
 }
 
+bool intel_report_dshield(AttackEntry& e) {
+    auto& cfg = g_config.get();
+    if (!cfg.dshield_enabled) return false;
+    if (cfg.dshield_email.length() == 0 || cfg.dshield_apikey.length() == 0) return false;
+    if (intel_ip_is_private(e.ip)) return true; // suppress private IP reports
+    
+    // Spawn async submission via DShieldReporter
+    return DShieldReporter::submit(e);
+}
+
 void intel_report_all(AttackEntry& e) {
     intel_report_abuseipdb(e);
     intel_report_otx(e);
+    intel_report_dshield(e);
     // Hub LAST so reported_to[] reflects the upstream reporters.
     intel_report_hub(e);
 }

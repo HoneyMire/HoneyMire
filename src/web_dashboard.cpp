@@ -554,11 +554,14 @@ static void send_config_page(AsyncWebServerRequest* req) {
     field("OTX API key", "otx_key", c.otx_key, "password");
     field("OTX pulse name", "otx_pulse_name", c.otx_pulse_name);
     field("OTX pulse id (fixed; empty = create-by-name)", "otx_pulse_id", c.otx_pulse_id);
+    checkbox("DShield", "dshield_enabled", c.dshield_enabled);
+    field("DShield email", "dshield_email", c.dshield_email, "email");
+    field("DShield API key", "dshield_apikey", c.dshield_apikey, "password");
     checkbox("HoneyOpus Hub", "hub_enabled", c.hub_enabled);
     field("Hub URL (origin only, no path)", "hub_url", c.hub_url);
     field("Hub token (hop_…)", "hub_token", c.hub_token, "password");
     addF(F("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
-           "Attacks coming from LAN/private IPs are never reported to AbuseIPDB or OTX. "
+           "Attacks coming from LAN/private IPs are never reported to AbuseIPDB, OTX, or DShield. "
            "The Hub <b>does</b> receive LAN attacks (idempotent on attack id). "
            "See <code>docs/INGEST_PROTOCOL.md</code> in the HoneyOpusHUB repo.</p>"));
     sec_close();
@@ -696,6 +699,9 @@ static void handle_config_post(AsyncWebServerRequest* req) {
     c.otx_key        = get("otx_key", c.otx_key);
     c.otx_pulse_name = get("otx_pulse_name", c.otx_pulse_name);
     c.otx_pulse_id   = get("otx_pulse_id", c.otx_pulse_id);
+    c.dshield_enabled = getBool("dshield_enabled", c.dshield_enabled);
+    c.dshield_email = get("dshield_email", c.dshield_email);
+    c.dshield_apikey = get("dshield_apikey", c.dshield_apikey);
     c.hub_enabled    = getBool("hub_enabled", c.hub_enabled);
     c.hub_url        = get("hub_url", c.hub_url);
     c.hub_token      = get("hub_token", c.hub_token);

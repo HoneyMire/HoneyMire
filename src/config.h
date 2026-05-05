@@ -76,6 +76,9 @@ struct Config {
     // — one per reboot). Leave empty to fall back to the cached/created
     // pulse-by-name behavior.
     String otx_pulse_id      = "69f726101fd2d1e4eba3a886";
+    bool   dshield_enabled   = false;
+    String dshield_email     = "";
+    String dshield_apikey    = "";
 
     // HoneyOpus Hub reporter — the project's own ingest endpoint, in
     // addition to AbuseIPDB / OTX. Spec: docs/INGEST_PROTOCOL.md

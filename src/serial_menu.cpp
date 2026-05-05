@@ -5,6 +5,7 @@
 #include "attack_log.h"
 
 #include <WiFi.h>
+#include <cstring>
 
 namespace honeyopus {
 
@@ -39,6 +40,8 @@ static void show_menu_() {
     Serial.println("  w) Toggle Web dashboard (next reboot)");
     Serial.println("  k) Set AbuseIPDB API key");
     Serial.println("  o) Set AlienVault OTX API key");
+    Serial.println("  d) Set DShield email");
+    Serial.println("  p) Set DShield API key");
     Serial.println("  u) Set HoneyOpus Hub URL");
     Serial.println("  b) Set HoneyOpus Hub token");
     Serial.println("  q) Quit menu");
@@ -63,6 +66,9 @@ static void show_config_() {
     Serial.printf("  otx             : %s (%s)\n",
                   c.otx_enabled ? "ENABLED" : "disabled",
                   c.otx_key.length() ? "key set" : "no key");
+    Serial.printf("  dshield         : %s (%s)\n",
+                  c.dshield_enabled ? "ENABLED" : "disabled",
+                  c.dshield_email.length() ? c.dshield_email.c_str() : "no email");
     Serial.printf("  hub             : %s url=%s (%s)\n",
                   c.hub_enabled ? "ENABLED" : "disabled",
                   c.hub_url.length() ? c.hub_url.c_str() : "(unset)",
@@ -94,7 +100,17 @@ static void list_sessions_() {
 
 static void prompt_for_(const char* what) {
     s_pending_field = what;
-    Serial.printf("  %s = ", what);
+    String label = what;
+    if (strcmp(what, "wifi_ssid") == 0) label = "WiFi SSID";
+    else if (strcmp(what, "wifi_pass") == 0) label = "WiFi password";
+    else if (strcmp(what, "hostname") == 0) label = "hostname";
+    else if (strcmp(what, "abuseipdb_key") == 0) label = "AbuseIPDB API key";
+    else if (strcmp(what, "otx_key") == 0) label = "OTX API key";
+    else if (strcmp(what, "dshield_email") == 0) label = "DShield email";
+    else if (strcmp(what, "dshield_apikey") == 0) label = "DShield API key";
+    else if (strcmp(what, "hub_url") == 0) label = "Hub URL";
+    else if (strcmp(what, "hub_token") == 0) label = "Hub token";
+    Serial.printf("  %s = ", label.c_str());
     s_state = State::Reading;
     s_buf = "";
 }
@@ -110,6 +126,12 @@ static void apply_pending_(const String& val) {
     } else if (s_pending_field == "otx_key") {
         c.otx_key = val;
         c.otx_enabled = val.length() > 0;
+    } else if (s_pending_field == "dshield_email") {
+        c.dshield_email = val;
+        c.dshield_enabled = c.dshield_email.length() > 0 && c.dshield_apikey.length() > 0;
+    } else if (s_pending_field == "dshield_apikey") {
+        c.dshield_apikey = val;
+        c.dshield_enabled = c.dshield_email.length() > 0 && c.dshield_apikey.length() > 0;
     } else if (s_pending_field == "hub_url") {
         String u = val;
         while (u.length() && u[u.length() - 1] == '/') u.remove(u.length() - 1);
@@ -184,6 +206,8 @@ static void handle_menu_char_(char c) {
         }
         case 'k': prompt_for_("abuseipdb_key"); return;
         case 'o': prompt_for_("otx_key");       return;
+        case 'd': prompt_for_("dshield_email"); return;
+        case 'p': prompt_for_("dshield_apikey");return;
         case 'u': prompt_for_("hub_url");       return;
         case 'b': prompt_for_("hub_token");     return;
         case 'q':
