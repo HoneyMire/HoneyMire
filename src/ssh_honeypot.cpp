@@ -429,7 +429,7 @@ static void handle_session(ssh_session sess) {
                 cast.in(exec_cmd.c_str(), exec_cmd.length());
                 String out = shell.execute(exec_cmd);
                 if (out.length()) chan_write(chan, cast, out);
-                entry.commands = 1;
+                entry.commands = shell.commandsRun();
                 classify_attack(entry, exec_cmd, millis(), millis());
             } else {
                 run_fake_shell(sess, chan, entry, cast);
