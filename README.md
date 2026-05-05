@@ -5,7 +5,7 @@ the built-in 0.42" OLED, LilyGO T-QT Pro with a 128×128 colour IPS, or a
 headless S3-N16R8 module). Records every captured session as an
 [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/), classifies the
 attacker (Mirai bot, IoT loader, manual operator, …), geolocates them, and
-optionally submits the IP to **AbuseIPDB**, **AlienVault OTX** and a
+optionally submits the IP to **AbuseIPDB**, **AlienVault OTX**, **DShield** and a
 self-hosted **HoneyOpus Hub** in the
 background. A web dashboard, captive-portal Wi-Fi setup, and serial CLI are
 bundled in.
@@ -84,8 +84,11 @@ HoneyOpus :: menu
   9) List asciinema sessions
   s) Toggle SSH enabled
   t) Toggle Telnet enabled
+  w) Toggle Web dashboard (next reboot)
   k) Set AbuseIPDB API key
   o) Set AlienVault OTX API key
+  d) Set DShield email
+  p) Set DShield API key
   u) Set HoneyOpus Hub URL
   b) Set HoneyOpus Hub token
 ```
@@ -116,7 +119,7 @@ Once associated, browse to `http://<board-ip>/`.
   player or ⬇️ download the `.cast` file.
 * **Config** — every setting lives behind clean accordions with proper toggle
   switches: Wi-Fi, fake banners/usernames, dashboard auth, geolocation
-  endpoint, **AbuseIPDB** + **OTX** toggles and API keys, display timers,
+  endpoint, **AbuseIPDB** + **OTX** + **DShield** toggles and API keys, display timers,
   storage caps. Includes a *Danger zone* button to wipe history while
   preserving configuration.
 * **Sessions** — flat list of every `.cast` on flash.
@@ -139,7 +142,7 @@ a single TLS request. You can turn the web dashboard off:
 
 The change applies on the **next reboot**. As a safety net, the firmware
 **refuses to disable the web dashboard unless at least one threat-intel
-reporter (AbuseIPDB / OTX / Hub) is enabled and credentialled** — otherwise
+reporter (AbuseIPDB / OTX / DShield / Hub) is enabled and credentialled** — otherwise
 the device would have zero remote visibility. The serial menu and the AP
 setup portal always remain available regardless of this flag, so you can
 recover from a serial console even after disabling the web UI.
@@ -158,7 +161,10 @@ never blocked. Each captured attack triggers:
    pulse id is pinned in *Config* (field *OTX pulse id*) so the same feed
    keeps growing across reboots. Leave it empty to fall back to
    create-by-name behaviour.
-4. **HoneyOpus Hub** — the project's own ingest endpoint for users running
+4. **DShield** — submissions to [dshield.org](https://dshield.org/), the
+   crowd-sourced Internet intrusion detection system by SANS Institute.
+   Requires a registered DShield account and API key.
+5. **HoneyOpus Hub** — the project's own ingest endpoint for users running
    their own dashboard. Each attack is POSTed once (idempotent on
    `(token, attack.id)`) to `<hub_url>/api/v1/ingest` as a single JSON
    document containing the full session metadata, geo, classification,
@@ -166,15 +172,15 @@ never blocked. Each captured attack triggers:
    hub reconstructs the asciicast on its side, so the firmware ships
    only the bytes that flowed in each direction (capped per board:
    32 KiB on C3, 64 KiB on T-QT Pro, 96 KiB on N16R8). Configure
-   *Hub URL* and *Hub token* in *Config*. Unlike AbuseIPDB/OTX, the
+   *Hub URL* and *Hub token* in *Config*. Unlike AbuseIPDB/OTX/DShield, the
    Hub **does** receive LAN attacks (so you can validate your setup).
    Token format is `hop_` + 32 base64url chars; see
    [`docs/INGEST_PROTOCOL.md`](https://github.com/KaSt/HoneyOpusHUB/blob/main/docs/INGEST_PROTOCOL.md)
    in the HoneyOpusHUB repo for the wire contract.
 
-The first three are off by default. Enable them in *Config* and paste your
+The first four are off by default. Enable them in *Config* and paste your
 API keys. **Attacks coming from LAN/private IPs are never reported** to
-AbuseIPDB or OTX (the Hub is exempt from this rule).
+AbuseIPDB, OTX, or DShield (the Hub is exempt from this rule).
 
 ## Asciinema sessions
 
@@ -252,7 +258,8 @@ src/
   telnet_honeypot.{h,cpp}
   ssh_honeypot.{h,cpp}    libssh-esp32 server
   geoip.{h,cpp}
-  intel.{h,cpp}           AbuseIPDB + OTX + HoneyOpus Hub reporters (background task)
+  intel.{h,cpp}           AbuseIPDB + OTX + DShield + HoneyOpus Hub reporters (background task)
+  dshield_reporter.{h,cpp} DShield.org async submission module
   wifi_manager.{h,cpp}    STA + SoftAP fallback + DNS hijack
   serial_menu.{h,cpp}
   web_dashboard.{h,cpp}   AsyncWebServer + captive portal + web installer page
