@@ -42,10 +42,11 @@ main{padding:18px;max-width:1400px;margin:0 auto}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--bord);text-align:left;vertical-align:top}
 td.when,td.nowrap,td.creds,td.rep,td.src{white-space:nowrap}
+td.when{cursor:help}
 .trunc{display:inline-block;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom;white-space:nowrap;max-width:100%}
 .trunc.user{max-width:12ch}
 .trunc.pass{max-width:18ch}
-.trunc.ip{max-width:16ch}
+.trunc.ip{max-width:40ch}
 .trunc.cmd{max-width:32ch}
 th.c,td.c{text-align:center}
 th{color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.05em;font-size:11px}
@@ -157,6 +158,26 @@ static String fmt_ts(time_t t) {
     // %z gives the numeric offset (e.g. +0200) so the rendered time is
     // unambiguous even if the user changes TZ later.
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %z", &tm);
+    return String(buf);
+}
+
+// Compact relative form ("15s ago", "3m ago", "2h ago", "4d ago") for the
+// dashboard's When column. The full ISO string still goes into the cell's
+// title= attribute so hovering reveals the exact timestamp. Saves enough
+// horizontal room that the Source column can fit a full IPv4 / IPv6
+// address without ellipsis.
+static String fmt_ts_relative(time_t t) {
+    if (t < 1700000000) return "—";          // NTP not synced yet
+    time_t now = time(nullptr);
+    if (now < 1700000000) return "—";
+    long delta = (long)now - (long)t;
+    if (delta < 0) delta = 0;                // small clock skew → "0s"
+    char buf[16];
+    if (delta < 60)              snprintf(buf, sizeof(buf), "%lds ago",  delta);
+    else if (delta < 3600)       snprintf(buf, sizeof(buf), "%ldm ago",  delta / 60);
+    else if (delta < 86400)      snprintf(buf, sizeof(buf), "%ldh ago",  delta / 3600);
+    else if (delta < 30 * 86400) snprintf(buf, sizeof(buf), "%ldd ago",  delta / 86400);
+    else                         snprintf(buf, sizeof(buf), "30d+ ago");
     return String(buf);
 }
 
@@ -309,10 +330,18 @@ static void send_dashboard(AsyncWebServerRequest* req) {
         g_attack_log.forEachRecent(50, [&](const AttackEntry& e) {
             String row;
             row.reserve(720);
-            char hdr[80];
-            snprintf(hdr, sizeof(hdr), "<tr><td class='c'>#%u</td><td class='when'>", (unsigned)e.id);
+            char hdr[200];
+            // Compact relative time in the cell, full ISO timestamp in the
+            // tooltip — saves space for the Source column. Both strings
+            // are produced by fmt_ts*/strftime; neither contains HTML
+            // metacharacters, so embedding into the static format is safe.
+            String full_ts = fmt_ts(e.ts);
+            String rel_ts  = fmt_ts_relative(e.ts);
+            snprintf(hdr, sizeof(hdr),
+                     "<tr><td class='c'>#%u</td><td class='when' title='%s'>",
+                     (unsigned)e.id, full_ts.c_str());
             row += hdr;
-            row += fmt_ts(e.ts);
+            row += rel_ts;
             row += "</td><td class='c'><span class='badge ";
             row += (e.protocol == "ssh" ? "ssh" : "tn");
             row += "'>";
