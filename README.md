@@ -259,7 +259,6 @@ src/
   ssh_honeypot.{h,cpp}    libssh-esp32 server
   geoip.{h,cpp}
   intel.{h,cpp}           AbuseIPDB + OTX + DShield + HoneyOpus Hub reporters (background task)
-  dshield_reporter.{h,cpp} DShield.org async submission module
   wifi_manager.{h,cpp}    STA + SoftAP fallback + DNS hijack
   serial_menu.{h,cpp}
   web_dashboard.{h,cpp}   AsyncWebServer + captive portal + web installer page

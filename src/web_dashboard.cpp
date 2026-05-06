@@ -7,6 +7,7 @@
 #include "intel.h"
 #include "attack_classifier.h"
 #include "attacker_gate.h"
+#include "restart_reason.h"
 
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -113,7 +114,10 @@ static bool authed(AsyncWebServerRequest* req) {
     // Skip basic-auth for clients on the local network — owners poking at
     // HoneyOpus from their LAN shouldn't have to enter credentials, and the
     // browser's auth dialog also breaks <a download> + asciinema fetch().
-    if (intel_ip_is_private(req->client()->remoteIP().toString())) return true;
+    // Disable dashboard_lan_bypass on untrusted LANs (campus/conference
+    // Wi-Fi, hotel networks). See ESP32 stability review WEB2.
+    if (c.dashboard_lan_bypass &&
+        intel_ip_is_private(req->client()->remoteIP().toString())) return true;
     return req->authenticate(c.dashboard_user.c_str(), c.dashboard_pass.c_str());
 }
 
@@ -422,6 +426,9 @@ static void send_dashboard(AsyncWebServerRequest* req) {
             row += e.reported_otx
                 ? F("<span class='repicon' title='AlienVault OTX reported' aria-label='OTX reported'>&#x1F989;</span>")
                 : F("<span class='repicon off' title='AlienVault OTX not reported' aria-label='AlienVault OTX not reported'>&#x1F989;</span>");
+            row += e.reported_dshield
+                ? F("<span class='repicon' title='DShield reported' aria-label='DShield reported'>&#x1F30A;</span>")
+                : F("<span class='repicon off' title='DShield not reported' aria-label='DShield not reported'>&#x1F30A;</span>");
             row += e.reported_hub
                 ? F("<span class='repicon' title='HoneyOpus Hub reported' aria-label='Hub reported'>&#x1F36F;</span>")
                 : F("<span class='repicon off' title='HoneyOpus Hub not reported' aria-label='Hub not reported'>&#x1F36F;</span>");
@@ -834,10 +841,25 @@ static void send_play_page(AsyncWebServerRequest* req) {
              "if(c)c.innerHTML='<p style=\"color:#e94560\">Player error: '"
              "+(ev.reason&&ev.reason.message?ev.reason.message:String(ev.reason))+'</p>';"
              "});");
+    // Transform each event line of the cast: rewrite kind 'i' → 'o' so
+    // asciinema-player actually renders attacker-typed lines. The player
+    // only paints 'o' (output) events on playback; in a real recording
+    // the typed text shows up in 'o' because the terminal echoes it.
+    // Our firmware deliberately does NOT record per-char echo (would
+    // produce a useless i,o,i,o,… alternation), so without this rewrite
+    // the local player would skip every typed line and the session
+    // appears with the credentials/commands missing — exactly the same
+    // failure mode the hub had before its own i→o flip. The forensic
+    // i/o distinction is preserved on the hub side via the events[]
+    // payload extracted from the same cast file.
     s->printf("var cont=document.getElementById('player');"
               "fetch('/cast?id=%u',{credentials:'same-origin',cache:'no-store'})"
               ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.text();})"
-              ".then(function(data){cont.innerHTML='';"
+              ".then(function(data){"
+              "data=data.split('\\n').map(function(L){"
+              "return L&&L[0]==='['?L.replace(/^(\\[[0-9.]+,)\"i\"(,)/,'$1\"o\"$2'):L;"
+              "}).join('\\n');"
+              "cont.innerHTML='';"
               "try{AsciinemaPlayer.create({data:data},cont,"
               "{autoPlay:true,fit:'width',terminalFontSize:'11px',terminalLineHeight:1.2,idleTimeLimit:2});}"
               "catch(e){cont.innerHTML='<p style=\"color:#e94560\">Player init failed: '+e.message+'</p>';"
@@ -1050,7 +1072,7 @@ static void portal_save(AsyncWebServerRequest* req) {
     req->send(200, "text/html; charset=utf-8", body);
     req->onDisconnect([](){
         delay(500);
-        ESP.restart();
+        restart::restart_with(restart::kReasonPortalSaved);
     });
 }
 

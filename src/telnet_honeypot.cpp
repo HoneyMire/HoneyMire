@@ -9,6 +9,7 @@
 #include "attack_classifier.h"
 #include "storage.h"
 #include "attacker_gate.h"
+#include "restart_reason.h"
 
 #include <WiFi.h>
 #include <AsyncTCP.h>
@@ -31,7 +32,18 @@ static volatile uint8_t s_active = 0;               // updated on connect/discon
 // Worker queue: AsyncTCP callbacks just push the session here, the worker task
 // does the slow LittleFS finalization so the AsyncTCP polling task stays
 // responsive (the previous design starved lwIP and triggered TCP asserts).
-struct TnFinalizeJob { void* sess; };
+//
+// The same queue also carries CLOSE jobs from telnet_reap(): the reaper
+// runs on loopTask, which is subscribed to the task watchdog, and
+// AsyncClient::close(true) can block waiting on lwIP/AsyncTCP internals
+// — that path was a known WDT trigger (see ESP32 stability review H2).
+// Routing close requests through the worker keeps loopTask boring.
+struct TnFinalizeJob {
+    enum Kind : uint8_t { K_FINALIZE, K_CLOSE };
+    Kind kind;
+    void* sess;            // valid when kind == K_FINALIZE
+    AsyncClient* client;   // valid when kind == K_CLOSE
+};
 static QueueHandle_t s_finalize_q = nullptr;
 
 // Live-session registry. AsyncTCP's per-client onPoll / onDisconnect
@@ -177,6 +189,8 @@ static void tn_handle_complete_line(TnSession* s) {
         if (s->attempts >= cfg.login_attempts_before_accept) {
             s->entry.authenticated = true;
             s->phase = TnSession::P_SHELL;
+            // Shell phase has begun — start recording the cast.
+            s->cast.setPaused(false);
             const auto& profile = telnet_persona_profile(s->persona);
             s->shell.begin(s->pending_user.length() ? s->pending_user : String(profile.fake_user),
                            profile.hostname);
@@ -229,8 +243,17 @@ static void tn_finalize_inline(TnSession* s) {
 
 static void tn_worker_task(void*) {
     for (;;) {
-        TnFinalizeJob j;
+        TnFinalizeJob j{};
         if (xQueueReceive(s_finalize_q, &j, portMAX_DELAY) != pdTRUE) continue;
+        if (j.kind == TnFinalizeJob::K_CLOSE) {
+            // Close request from telnet_reap. Calling close(true) here
+            // (rather than from loopTask) means a slow lwIP teardown
+            // can't trip the main-loop watchdog — at worst it stalls
+            // the worker, which is nobody's WDT subscriber.
+            if (j.client) j.client->close(true);
+            continue;
+        }
+        // K_FINALIZE — run the slow forensics path off the AsyncTCP task.
         TnSession* s = (TnSession*)j.sess;
         if (!s) continue;
         tn_finalize_inline(s);
@@ -251,7 +274,10 @@ static void tn_finalize(TnSession* s) {
     // when this is called from the main-loop reaper while AsyncTCP is itself
     // blocked (e.g. in a slow Serial.printf). Instead, the callbacks
     // themselves check s->finalized and short-circuit.
-    TnFinalizeJob j{ .sess = s };
+    TnFinalizeJob j{};
+    j.kind   = TnFinalizeJob::K_FINALIZE;
+    j.sess   = s;
+    j.client = nullptr;
     if (s_finalize_q && xQueueSend(s_finalize_q, &j, 0) == pdTRUE) return;
     // Queue full or not initialized — finalize inline as a fallback.
     tn_finalize_inline(s);
@@ -291,24 +317,38 @@ static void tn_on_data(void* arg, AsyncClient* /*c*/, void* data, size_t len) {
         if (ch == 255) { s->iac_state = 1; continue; }
 
         // Line editing.
+        //
+        // We record line-grain (not byte-grain) into the asciicast: per-byte
+        // recording produces one i-event AND one o-event (the echo) per
+        // keystroke, which on the hub boils down to a useless `i,o,i,o,…`
+        // alternation that no amount of same-direction coalescing can fix.
+        // Instead we accumulate into s->line_buf and emit a single
+        // input-direction event when ENTER (or Ctrl-C) commits the line.
+        // Echoes are still sent on the wire (so the attacker sees their
+        // typing in real time) but with record=false so they don't pollute
+        // the cast.
         if (ch == '\r' || ch == '\n') {
             if (ch == '\r' && i + 1 < len && (p[i+1] == '\n' || p[i+1] == '\0')) i++;
-            s->cast.in("\r\n", 2);
-            tn_send(s, "\r\n", 2);
+            String evt = s->line_buf + "\r\n";
+            s->cast.in(evt.c_str(), evt.length());
+            tn_send(s, "\r\n", 2, /*record=*/false);
             tn_handle_complete_line(s);
             continue;
         }
         if (ch == 0x7f || ch == 0x08) {
             if (s->line_buf.length()) {
                 s->line_buf.remove(s->line_buf.length() - 1);
-                s->cast.in((const char*)&ch, 1);
-                if (s->phase != TnSession::P_PASS) tn_send(s, "\b \b", 3);
+                if (s->phase != TnSession::P_PASS)
+                    tn_send(s, "\b \b", 3, /*record=*/false);
             }
             continue;
         }
-        if (ch == 0x03) { // Ctrl-C
-            s->cast.in((const char*)&ch, 1);
-            tn_send(s, "^C\r\n", 4);
+        if (ch == 0x03) { // Ctrl-C — record the abandoned line + ^C\r\n as
+                          // one forensic input event (attacker's intent
+                          // before they bailed).
+            String evt = s->line_buf + "^C\r\n";
+            s->cast.in(evt.c_str(), evt.length());
+            tn_send(s, "^C\r\n", 4, /*record=*/false);
             s->line_buf = "";
             if (s->phase == TnSession::P_SHELL) tn_send(s, s->shell.prompt());
             continue;
@@ -316,12 +356,11 @@ static void tn_on_data(void* arg, AsyncClient* /*c*/, void* data, size_t len) {
         if (ch < 0x20) continue;
         if (s->line_buf.length() > 256) continue;
         s->line_buf += (char)ch;
-        s->cast.in((const char*)&ch, 1);
         if (s->phase == TnSession::P_PASS) {
-            tn_send(s, "*", 1);
+            tn_send(s, "*", 1, /*record=*/false);
         } else {
             char e = (char)ch;
-            tn_send(s, &e, 1);
+            tn_send(s, &e, 1, /*record=*/false);
         }
     }
 }
@@ -329,11 +368,12 @@ static void tn_on_data(void* arg, AsyncClient* /*c*/, void* data, size_t len) {
 static void tn_on_disconnect(void* arg, AsyncClient* /*c*/) {
     auto* s = (TnSession*)arg;
     if (!s) return;
-    if (s->finalized) {
-        // Reaper already queued cleanup; just delete the shell-only struct.
-        delete s;
-        return;
-    }
+    // Idempotent: if finalize has already run (or is already queued to
+    // the worker), do NOT delete s here — the worker owns its lifetime.
+    // Deleting from this path while the worker is mid-finalize causes
+    // a use-after-free; AsyncTCP can deliver duplicate disconnect
+    // callbacks under memory pressure. See ESP32 stability review H1.
+    if (s->finalized) return;
     tn_finalize(s);
 }
 
@@ -406,6 +446,11 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     s->cast.begin(cast_path, TN_COLS, TN_ROWS,
                   "Telnet session from " + s->entry.ip,
                   "/bin/login");
+    // Suppress recording during the auth dance — login prompts and the
+    // typed credentials are noise in the transcript. The captured
+    // user/pass live on s->entry.{user,pass} already; the recorded cast
+    // is for the actual shell session that follows.
+    s->cast.setPaused(true);
     s->entry.cast_path = cast_path;
 
     g_display.showAttack(AttackKind::Telnet);
@@ -486,18 +531,26 @@ void telnet_reap() {
         Serial.printf("[telnet] reaper: session id=%u idle >%us, closing\n",
                       (unsigned)log_vids[i], (unsigned)(kTnIdleTimeoutMs / 1000));
     }
-    // Best-effort close. AsyncTCP marshals close onto the tcpip thread, so
-    // the call itself is thread-safe; the v3 patch guarantees the
-    // tcp_recved() that may follow can't overflow rcv_ann_wnd.
+    // Best-effort close — done on the worker task, NOT here on loopTask.
+    // close(true) can block waiting for lwIP/AsyncTCP internal state and
+    // would otherwise trip the loopTask watchdog (ESP32 stability review
+    // H2). The worker is allowed to stall; loopTask is not.
     for (size_t i = 0; i < close_n; ++i) {
-        if (close_victims[i]) close_victims[i]->close(true);
+        if (!close_victims[i]) continue;
+        TnFinalizeJob j{};
+        j.kind   = TnFinalizeJob::K_CLOSE;
+        j.sess   = nullptr;
+        j.client = close_victims[i];
+        if (!s_finalize_q || xQueueSend(s_finalize_q, &j, 0) != pdTRUE) {
+            // Queue full — fall back to inline close. Better to risk a
+            // single watchdog tick than to leak the slot indefinitely.
+            close_victims[i]->close(true);
+        }
     }
     if (reboot_needed) {
         Serial.printf("[telnet] reaper: session id=%u still stuck after close, rebooting\n",
                       (unsigned)reboot_vid);
-        Serial.flush();
-        delay(50);
-        ESP.restart();
+        restart::restart_with(restart::kReasonTelnetStuck);
     }
 }
 

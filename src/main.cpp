@@ -35,6 +35,7 @@
 #include "ssh_honeypot.h"
 #include "intel.h"
 #include "attacker_gate.h"
+#include "restart_reason.h"
 
 using namespace honeyopus;
 
@@ -80,6 +81,7 @@ void setup() {
     std::set_new_handler(honeyopus_new_handler);
     Serial.println();
     Serial.println("==== HoneyOpus booting (" HONEYOPUS_BOARD_NAME ") ====");
+    restart::log_on_boot();
     Serial.printf("chip: %s rev=%u  cpu=%uMHz  free_heap=%u\n",
                   ESP.getChipModel(), ESP.getChipRevision(),
                   ESP.getCpuFreqMHz(), ESP.getFreeHeap());
@@ -208,9 +210,7 @@ void loop() {
         else if (now - low_heap_since > kLowHeapRebootMs) {
             Serial.printf("[health] heap stuck low for %us — rebooting\n",
                           (unsigned)((now - low_heap_since) / 1000));
-            Serial.flush();
-            delay(50);
-            ESP.restart();
+            restart::restart_with(restart::kReasonHeapLow);
         }
     } else {
         low_heap_since = 0;

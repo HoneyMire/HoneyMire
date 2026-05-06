@@ -26,6 +26,17 @@ public:
     String path() const { return path_; }
     size_t bytes() const { return bytes_; }
 
+    // While paused, in()/out() become no-ops. The honeypots use this to
+    // suppress recording during the auth dance (login prompts, typed
+    // credentials) — the captured user/pass already live on the
+    // AttackEntry, and the recorded transcript is more useful when it
+    // contains only the shell session itself. Defaults to NOT paused
+    // for backwards compatibility; honeypots opt in by calling
+    // setPaused(true) right after begin() and setPaused(false) when
+    // the shell phase starts.
+    void setPaused(bool p) { paused_ = p; }
+    bool isPaused() const  { return paused_; }
+
 private:
     void writeEvent_(char kind, const char* data, size_t len);
     void writeEscaped_(const char* data, size_t len);
@@ -35,6 +46,7 @@ private:
     uint32_t start_us_ = 0;
     uint32_t last_flush_ms_ = 0;
     size_t   bytes_ = 0;
+    bool     paused_ = false;
 };
 
 } // namespace honeyopus

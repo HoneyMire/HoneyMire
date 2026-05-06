@@ -48,6 +48,22 @@ struct Config {
     bool   dashboard_auth_enabled = false;
     String dashboard_user = "admin";
     String dashboard_pass = "honeyopus";
+    // When true (default), clients on RFC1918 / link-local / CGNAT
+    // addresses skip the basic-auth prompt — convenient on a home LAN
+    // but a privacy hazard if the device sits on an untrusted network
+    // (campus Wi-Fi, conference network, hotel LAN). Disable this to
+    // require auth from every client.
+    bool   dashboard_lan_bypass = true;
+
+    // WiFi reliability tuning. The outbound probe (TCP/53 to the
+    // gateway) is a coarse "do packets leave the LAN" check. Many
+    // routers don't accept TCP/53 on the gateway IP, so the probe can
+    // false-negative on healthy networks. By default the probe is
+    // observability-only — failures are logged but do NOT force STA
+    // reconnects. Enable wifi_probe_kick if you actually want failed
+    // probes to bounce STA (matches the historical behaviour).
+    bool   wifi_probe_enabled = true;
+    bool   wifi_probe_kick    = false;
 
     // Whether the web dashboard / API is started at boot. Disabling it
     // frees ~30-50 KiB of internal heap (AsyncWebServer + handlers +

@@ -119,12 +119,24 @@ static void chan_write(ssh_channel chan, Asciinema& cast, const String& s) {
     chan_write(chan, cast, s.c_str(), s.length());
 }
 
+// Send bytes to the attacker WITHOUT recording into the asciicast — used
+// for per-char echoes during line editing. We record line-grain into the
+// cast (one input event per completed line); per-char echoes would
+// pollute the stream with a useless `i,o,i,o,…` alternation that no
+// hub-side coalescing can fix.
+static void chan_write_norec(ssh_channel chan, const char* s, size_t n) {
+    if (!chan || !s || n == 0) return;
+    ssh_channel_write(chan, s, n);
+}
+
 static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entry, Asciinema& cast) {
     auto& cfg = g_config.get();
     FakeShell shell;
     shell.begin(entry.user.length() ? entry.user : String(cfg.fake_user), cfg.fake_hostname);
     shell.setSessionInfo(entry.id, entry.ip, entry.port, "ssh",
                          entry.cast_path + ".events.jsonl");
+    // Shell phase: start recording the cast.
+    cast.setPaused(false);
     chan_write(chan, cast, shell.motd());
     chan_write(chan, cast, shell.prompt());
 
@@ -143,11 +155,15 @@ static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entr
             continue;
         }
         last_activity_ms = millis();
-        cast.in(buf, n);
+        // Don't record the raw recv chunk — we record line-grain at ENTER
+        // below so input events are one-per-line, not one-per-keystroke.
         for (int i = 0; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
             if (c == '\r' || c == '\n') {
-                chan_write(chan, cast, "\r\n", 2);
+                // Record the completed line + CRLF as a single input event.
+                String evt = line + "\r\n";
+                cast.in(evt.c_str(), evt.length());
+                chan_write_norec(chan, "\r\n", 2);
                 String out = shell.execute(line);
                 line = "";
                 if (out.length()) chan_write(chan, cast, out);
@@ -158,12 +174,15 @@ static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entr
             if (c == 0x7f || c == 0x08) {
                 if (line.length()) {
                     line.remove(line.length() - 1);
-                    chan_write(chan, cast, "\b \b", 3);
+                    chan_write_norec(chan, "\b \b", 3);
                 }
                 continue;
             }
-            if (c == 0x03) { // Ctrl-C
-                chan_write(chan, cast, "^C\r\n", 4);
+            if (c == 0x03) { // Ctrl-C — record the abandoned line + ^C\r\n
+                             // as one forensic input event.
+                String evt = line + "^C\r\n";
+                cast.in(evt.c_str(), evt.length());
+                chan_write_norec(chan, "^C\r\n", 4);
                 line = "";
                 chan_write(chan, cast, shell.prompt());
                 continue;
@@ -176,7 +195,7 @@ static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entr
             if (line.length() < 256) {
                 line += (char)c;
                 char e = (char)c;
-                chan_write(chan, cast, &e, 1);
+                chan_write_norec(chan, &e, 1);
             }
         }
     }
@@ -212,6 +231,12 @@ static void handle_session(ssh_session sess) {
     cast.begin(cast_path, SSH_COLS, SSH_ROWS,
                "SSH session from " + entry.ip,
                "/bin/bash");
+    // Suppress recording until the shell phase starts. SSH auth happens
+    // via libssh messages (not through the cast pipeline), so this is
+    // mostly defensive — but it also means a session that gets accepted
+    // but then sends junk channel-requests writes nothing to the cast.
+    // run_fake_shell / the exec-mode branch flip paused→false.
+    cast.setPaused(true);
     entry.cast_path = cast_path;
     uint32_t t0 = millis();
 
@@ -426,6 +451,9 @@ static void handle_session(ssh_session sess) {
                 shell.begin(entry.user.length() ? entry.user : String(cfg.fake_user), cfg.fake_hostname);
                 shell.setSessionInfo(entry.id, entry.ip, entry.port, "ssh",
                                      entry.cast_path + ".events.jsonl");
+                // Exec-mode: a one-shot command is the entire shell phase
+                // for this session. Start recording.
+                cast.setPaused(false);
                 cast.in(exec_cmd.c_str(), exec_cmd.length());
                 String out = shell.execute(exec_cmd);
                 if (out.length()) chan_write(chan, cast, out);

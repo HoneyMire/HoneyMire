@@ -68,7 +68,7 @@ void Asciinema::writeEscaped_(const char* data, size_t len) {
 }
 
 void Asciinema::writeEvent_(char kind, const char* data, size_t len) {
-    if (!f_) return;
+    if (!f_ || paused_) return;
     uint32_t now = micros();
     uint32_t elapsed_us = now - start_us_;
     uint32_t secs = elapsed_us / 1000000UL;

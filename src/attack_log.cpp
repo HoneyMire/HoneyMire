@@ -3,6 +3,7 @@
 #include "storage.h"
 
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <algorithm>
 #include <unordered_map>
 #include <freertos/task.h>
@@ -13,6 +14,17 @@ namespace honeyopus {
 AttackLog g_attack_log;
 
 static const char* LOG_PATH = "/attacks/log.jsonl";
+
+// NVS-backed shadow of next_id_. Without this, an attack id allocated at
+// connect time but never finalized (e.g. a leaked telnet session that
+// AsyncTCP fails to onDisconnect) is lost on reboot — the JSONL log
+// only contains FINALIZED entries, so begin()'s scan resurrects an
+// older next_id_ and the next probe gets handed the same id. The
+// reaper then logs the same id again, may reboot, and the cycle
+// repeats. The shadow is updated on every nextId() call so even an id
+// that never reaches finalize is permanently consumed.
+static const char*   kNvsAlogNs       = "alog";
+static const char*   kNvsKeyNextId    = "nid";
 
 // Persister-task tuning. The queue holds attack ids (uint32_t); a 0 sentinel
 // means "compact the file now". 16 slots is plenty for a single ESP32-C3
@@ -64,6 +76,7 @@ void AttackEntry::toJson(JsonObject o) const {
     o["reported_abuseipdb"] = reported_abuseipdb;
     o["reported_otx"]  = reported_otx;
     o["reported_hub"]  = reported_hub;
+    o["reported_dshield"] = reported_dshield;
 }
 
 AttackEntry AttackEntry::fromJson(JsonObjectConst o) {
@@ -96,6 +109,7 @@ AttackEntry AttackEntry::fromJson(JsonObjectConst o) {
     e.reported_abuseipdb = o["reported_abuseipdb"] | false;
     e.reported_otx       = o["reported_otx"]       | false;
     e.reported_hub       = o["reported_hub"]       | false;
+    e.reported_dshield   = o["reported_dshield"]   | false;
     return e;
 }
 
@@ -142,6 +156,19 @@ bool AttackLog::begin() {
         }
     }
 
+    // Cross-check next_id_ against the NVS shadow. The JSONL only sees
+    // FINALIZED attacks; the shadow sees every id ever allocated. Take
+    // the max so an id handed out for a now-leaked session is never
+    // recycled into a new connection.
+    {
+        Preferences p;
+        if (p.begin(kNvsAlogNs, true)) {
+            uint32_t shadow = p.getUInt(kNvsKeyNextId, 0);
+            p.end();
+            if (shadow > next_id_) next_id_ = shadow;
+        }
+    }
+
     // Spin up the persister task once. It owns ALL file I/O so async_tcp,
     // intel and ssh tasks never block on LittleFS while holding the
     // attack-log mutex. Without this, a slow LittleFS write during a flood
@@ -157,7 +184,16 @@ bool AttackLog::begin() {
     return true;
 }
 
-uint32_t AttackLog::nextId() { LogLock lk(mtx_); return next_id_++; }
+uint32_t AttackLog::nextId() {
+    LogLock lk(mtx_);
+    uint32_t id = next_id_++;
+    // Do NOT write NVS here — nextId() is called from AsyncTCP and SSH
+    // callbacks, and Preferences.putUInt() can stall under flash GC /
+    // wear-leveling. The persister task picks up the new high-water
+    // mark and writes it to NVS off the hot path. See ESP32 stability
+    // review H7.
+    return id;
+}
 
 void AttackLog::persistAppend_(const AttackEntry& e) {
     // Under extreme heap pressure (typically right after a failed mbedTLS
@@ -261,10 +297,19 @@ void AttackLog::persistTaskTrampoline_(void* arg) {
 }
 
 void AttackLog::persistTaskRun_() {
+    // Cache of the value last written to the NVS next_id_ shadow. The
+    // shadow tracks every id ever allocated (whether or not the session
+    // ever finalized), so a leaked session can never have its id reused
+    // after reboot — see ESP32 stability review H7.
+    uint32_t last_persisted_next_id = 0;
     for (;;) {
         uint32_t id = 0;
-        if (xQueueReceive(persist_q_, &id, portMAX_DELAY) != pdTRUE) continue;
-        if (id != 0) {
+        // Wake on a queued attack OR every 30 s, whichever comes first.
+        // The periodic wake lets us flush the next_id_ shadow even when
+        // the log is idle (e.g. probes that allocate ids but never
+        // finalize).
+        BaseType_t got = xQueueReceive(persist_q_, &id, pdMS_TO_TICKS(30000));
+        if (got == pdTRUE && id != 0) {
             // Snapshot the entry under the lock, then write without it.
             AttackEntry snap;
             bool have = false;
@@ -282,6 +327,7 @@ void AttackLog::persistTaskRun_() {
         // lock, then write it without holding the lock.
         bool need_compact = false;
         std::vector<AttackEntry> snap;
+        uint32_t cur_next_id = 0;
         {
             LogLock lk(mtx_);
             const size_t threshold = dirty_ ? kAppendCompactN : kUpdateCompactN;
@@ -289,8 +335,21 @@ void AttackLog::persistTaskRun_() {
                 need_compact = true;
                 snap = entries_;
             }
+            cur_next_id = next_id_;
         }
         if (need_compact) rewriteAllSnapshot_(snap);
+
+        // Flush the NVS shadow if it's behind the current high water
+        // mark. This runs off the network callback path, so a flash GC
+        // stall here can't wedge AsyncTCP.
+        if (cur_next_id > last_persisted_next_id) {
+            Preferences p;
+            if (p.begin(kNvsAlogNs, false)) {
+                p.putUInt(kNvsKeyNextId, cur_next_id);
+                p.end();
+                last_persisted_next_id = cur_next_id;
+            }
+        }
     }
 }
 
@@ -328,6 +387,14 @@ void AttackLog::clearAll() {
     appends_since_compact_ = 0;
     File f = LittleFS.open(LOG_PATH, "w");
     if (f) f.close();
+    // Reset the NVS shadow too — otherwise next_id_ would jump back up
+    // to whatever the leaked-session high-water-mark was on the next
+    // call to nextId().
+    Preferences p;
+    if (p.begin(kNvsAlogNs, false)) {
+        p.putUInt(kNvsKeyNextId, 1);
+        p.end();
+    }
 }
 
 } // namespace honeyopus

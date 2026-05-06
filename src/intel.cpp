@@ -1,7 +1,6 @@
 #include "intel.h"
 #include "config.h"
 #include "geoip.h"
-#include "dshield_reporter.h"
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -666,6 +665,7 @@ bool intel_report_hub(AttackEntry& e) {
     JsonArray rt = at["reported_to"].to<JsonArray>();
     if (e.reported_abuseipdb) rt.add("abuseipdb");
     if (e.reported_otx)       rt.add("otx");
+    if (e.reported_dshield)   rt.add("dshield");
 
     // attack.session — optional but recommended; carries the i/o transcript.
     JsonObject ses = at["session"].to<JsonObject>();
@@ -796,14 +796,132 @@ bool intel_report_hub(AttackEntry& e) {
     return false;
 }
 
+// ---- DShield bulk submitter -------------------------------------------
+//
+// DShield is rate-strict: we MUST NOT submit more than once per 30
+// minutes, MUST NOT submit at all in the first 30 minutes after boot,
+// and SHOULD batch multiple captures into a single bulk POST.
+//
+// Each call to intel_report_dshield(e) only ENQUEUES the attack id;
+// the actual POST happens later in intel_dshield_drain_(), which the
+// intel task wakes up to run periodically. cooldown_check_/commit_
+// pre-deduplicates same-IP entries inside a single batch so the bulk
+// payload doesn't list the same attacker twice.
+//
+// Side effect: when the hub reporter POSTs an attack, e.reported_dshield
+// is still false (the bulk POST happens up to 30 min later), so
+// "dshield" won't appear in the hub payload's reported_to[] for that
+// attack. The local dashboard's 🌊 icon DOES update correctly when the
+// drain succeeds — g_attack_log.update(e) re-persists the flag.
+static const uint32_t       kDshieldCdSec          = 15 * 60;
+static const uint32_t       kDshieldMinIntervalMs  = 30u * 60u * 1000u;
+static const size_t         kDshieldPendingMax     = 100;
+static std::vector<CdEntry> s_cd_dshield;
+static std::vector<uint32_t> s_dshield_pending;     // attack ids awaiting bulk POST
+// Earliest absolute millis() we're allowed to send. Initialised to
+// kDshieldMinIntervalMs so the first allowable send is at least 30 min
+// after boot, satisfying "never just after booting on first attack".
+static uint32_t              s_dshield_next_ms     = kDshieldMinIntervalMs;
+
 bool intel_report_dshield(AttackEntry& e) {
     auto& cfg = g_config.get();
     if (!cfg.dshield_enabled) return false;
     if (cfg.dshield_email.length() == 0 || cfg.dshield_apikey.length() == 0) return false;
-    if (intel_ip_is_private(e.ip)) return true; // suppress private IP reports
-    
-    // Spawn async submission via DShieldReporter
-    return DShieldReporter::submit(e);
+    if (e.reported_dshield) return true;
+    if (intel_ip_is_private(e.ip)) {
+        Serial.printf("[dshield] skip private/LAN ip=%s\n", e.ip.c_str());
+        return false;
+    }
+    uint32_t now = (uint32_t)(millis() / 1000);
+    if (!cooldown_check_(s_cd_dshield, e.ip, now, kDshieldCdSec)) {
+        // Same IP already queued or recently submitted — drop the
+        // duplicate so the bulk payload stays compact.
+        return false;
+    }
+    // Bound the pending list. If we hit the cap (e.g. heavy attack burst
+    // during the first-30-min boot window), drop the oldest entry to
+    // make room — the newer capture is more likely to still be in the
+    // attack log when we eventually drain.
+    if (s_dshield_pending.size() >= kDshieldPendingMax) {
+        s_dshield_pending.erase(s_dshield_pending.begin());
+    }
+    s_dshield_pending.push_back(e.id);
+    cooldown_commit_(s_cd_dshield, e.ip, now);
+    return true;
+}
+
+// Run from the intel task on each wake-up. Sends at most one POST per
+// invocation, only when the 30-min interval has elapsed since the last
+// send (or since boot for the very first send).
+static void intel_dshield_drain_() {
+    auto& cfg = g_config.get();
+    if (!cfg.dshield_enabled) return;
+    if (cfg.dshield_email.length() == 0 || cfg.dshield_apikey.length() == 0) return;
+    if (s_dshield_pending.empty()) return;
+    if (millis() < s_dshield_next_ms) return;
+    if (!heap_ok_for_tls_("dshield")) return;
+
+    JsonDocument d;
+    d["email"]  = cfg.dshield_email;
+    d["apikey"] = cfg.dshield_apikey;
+    d["format"] = "json";
+    JsonArray logs = d["logs"].to<JsonArray>();
+    std::vector<uint32_t> sent_ids;
+    sent_ids.reserve(s_dshield_pending.size());
+    for (uint32_t id : s_dshield_pending) {
+        AttackEntry e;
+        if (!g_attack_log.getById(id, e)) continue;
+        JsonObject o = logs.add<JsonObject>();
+        o["timestamp"]     = (uint32_t)e.ts;
+        o["src_ip"]        = e.ip;
+        o["dst_port"]      = e.port;
+        o["protocol"]      = e.protocol;
+        o["username"]      = e.user;
+        o["authenticated"] = e.authenticated;
+        o["attempts"]      = e.auth_attempts;
+        o["commands"]      = e.commands;
+        sent_ids.push_back(id);
+    }
+    if (sent_ids.empty()) {
+        // All pending ids were aged out of the on-disk log; drop them.
+        s_dshield_pending.clear();
+        return;
+    }
+
+    WiFiClientSecure cs;
+    cs.setInsecure();
+    cs.setHandshakeTimeout(15);
+    HTTPClient http;
+    if (!http.begin(cs, "https://dshield.org/api/handler/submit/")) return;
+    http.addHeader("Content-Type", "application/json");
+    http.setConnectTimeout(15000);
+    http.setTimeout(30000);
+
+    String body; serializeJson(d, body);
+    int code = http.POST(body);
+    String resp = http.getString();
+    http.end();
+
+    // Consume the 30-min window regardless of outcome. The user
+    // explicitly asked for ≥30 min between attempts; respecting that on
+    // failure too is safer than hammering a service that just refused.
+    s_dshield_next_ms = millis() + kDshieldMinIntervalMs;
+
+    if (code >= 200 && code < 300) {
+        Serial.printf("[dshield] bulk submitted %u attacks, http=%d (%u B body)\n",
+                      (unsigned)sent_ids.size(), code, (unsigned)body.length());
+        for (uint32_t id : sent_ids) {
+            AttackEntry e;
+            if (!g_attack_log.getById(id, e)) continue;
+            e.reported_dshield = true;
+            g_attack_log.update(e);
+        }
+        s_dshield_pending.clear();
+    } else {
+        Serial.printf("[dshield] bulk submit failed http=%d size=%u resp=%s — retrying in 30 min\n",
+                      code, (unsigned)sent_ids.size(), resp.c_str());
+        // Keep pending list intact — next drain will retry the same set.
+    }
 }
 
 void intel_report_all(AttackEntry& e) {
@@ -815,14 +933,21 @@ void intel_report_all(AttackEntry& e) {
 }
 
 static void intelTask_(void*) {
-    uint32_t id;
     for (;;) {
-        if (xQueueReceive(s_q, &id, portMAX_DELAY) != pdTRUE) continue;
-        AttackEntry e;
-        if (!g_attack_log.getById(id, e)) continue;
-        if (!e.geo_resolved && g_config.get().geoip_enabled) geoip_lookup(e);
-        intel_report_all(e);
-        g_attack_log.update(e);
+        // Wake on a new attack OR after 60 s, whichever comes first. The
+        // periodic wake lets the DShield bulk drain fire even when no
+        // new attacks are arriving — required so the 30-min retry path
+        // and the post-boot first-send still trigger.
+        uint32_t id = 0;
+        if (xQueueReceive(s_q, &id, pdMS_TO_TICKS(60000)) == pdTRUE) {
+            AttackEntry e;
+            if (g_attack_log.getById(id, e)) {
+                if (!e.geo_resolved && g_config.get().geoip_enabled) geoip_lookup(e);
+                intel_report_all(e);
+                g_attack_log.update(e);
+            }
+        }
+        intel_dshield_drain_();
     }
 }
 

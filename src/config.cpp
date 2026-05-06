@@ -85,7 +85,10 @@ bool ConfigStore::load() {
     cfg_.dashboard_auth_enabled = getBool("dash_en", cfg_.dashboard_auth_enabled);
     cfg_.dashboard_user  = getStr("dash_u", cfg_.dashboard_user);
     cfg_.dashboard_pass  = getStr("dash_p", cfg_.dashboard_pass);
+    cfg_.dashboard_lan_bypass = getBool("dash_lan", cfg_.dashboard_lan_bypass);
     cfg_.web_enabled     = getBool("web_en",  cfg_.web_enabled);
+    cfg_.wifi_probe_enabled = getBool("wf_pb_en", cfg_.wifi_probe_enabled);
+    cfg_.wifi_probe_kick    = getBool("wf_pb_kk", cfg_.wifi_probe_kick);
     cfg_.geoip_enabled   = getBool("geo_en", cfg_.geoip_enabled);
     cfg_.geoip_url       = getStr("geo_url", cfg_.geoip_url);
     cfg_.abuseipdb_enabled = getBool("aipdb_en", cfg_.abuseipdb_enabled);
@@ -98,6 +101,9 @@ bool ConfigStore::load() {
     cfg_.hub_enabled     = getBool("hub_en",  cfg_.hub_enabled);
     cfg_.hub_url         = getStr("hub_url",  cfg_.hub_url);
     cfg_.hub_token       = getStr("hub_tok",  cfg_.hub_token);
+    cfg_.dshield_enabled = getBool("ds_en",   cfg_.dshield_enabled);
+    cfg_.dshield_email   = getStr("ds_email", cfg_.dshield_email);
+    cfg_.dshield_apikey  = getStr("ds_key",   cfg_.dshield_apikey);
     cfg_.tz              = getStr("tz",       cfg_.tz);
     cfg_.ntp_server1     = getStr("ntp1",     cfg_.ntp_server1);
     cfg_.ntp_server2     = getStr("ntp2",     cfg_.ntp_server2);
@@ -124,7 +130,10 @@ bool ConfigStore::save() {
     prefs_.putBool("dash_en", cfg_.dashboard_auth_enabled);
     prefs_.putString("dash_u", cfg_.dashboard_user);
     prefs_.putString("dash_p", cfg_.dashboard_pass);
+    prefs_.putBool("dash_lan", cfg_.dashboard_lan_bypass);
     prefs_.putBool("web_en",  cfg_.web_enabled);
+    prefs_.putBool("wf_pb_en", cfg_.wifi_probe_enabled);
+    prefs_.putBool("wf_pb_kk", cfg_.wifi_probe_kick);
     prefs_.putBool("geo_en", cfg_.geoip_enabled);
     prefs_.putString("geo_url", cfg_.geoip_url);
     prefs_.putBool("aipdb_en", cfg_.abuseipdb_enabled);
@@ -137,6 +146,9 @@ bool ConfigStore::save() {
     prefs_.putBool("hub_en",  cfg_.hub_enabled);
     prefs_.putString("hub_url", cfg_.hub_url);
     prefs_.putString("hub_tok", cfg_.hub_token);
+    prefs_.putBool("ds_en",      cfg_.dshield_enabled);
+    prefs_.putString("ds_email", cfg_.dshield_email);
+    prefs_.putString("ds_key",   cfg_.dshield_apikey);
     prefs_.putString("tz",     cfg_.tz);
     prefs_.putString("ntp1",   cfg_.ntp_server1);
     prefs_.putString("ntp2",   cfg_.ntp_server2);

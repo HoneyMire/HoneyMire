@@ -1,6 +1,7 @@
 #include "wifi_manager.h"
 #include "config.h"
 #include "display.h"
+#include "restart_reason.h"
 
 #include <WiFi.h>
 #include <DNSServer.h>
@@ -30,6 +31,15 @@ static const uint8_t  kProbeFailLimit  = 3;
 static uint32_t s_last_probe = 0;
 static uint8_t  s_probe_fails = 0;
 static volatile bool s_event_disconnected = false;
+// Last STA disconnect reason captured by the event handler. Logged once
+// from wifi_loop() when it changes — the event handler runs on the WiFi
+// task and must stay short. Reasons are documented in
+// esp_wifi_types.h::wifi_err_reason_t (e.g. 2=AUTH_EXPIRE, 6=NOT_AUTHED,
+// 8=ASSOC_LEAVE, 15=4WAY_HANDSHAKE_TIMEOUT, 200/201/202=AUTH_FAIL).
+static volatile uint8_t s_last_disc_reason   = 0;
+static volatile bool    s_last_disc_logged   = true;
+// On boot we don't yet have a reason to report; flip false the first
+// time the handler captures one so wifi_loop() can surface it.
 
 NetMode wifi_mode() { return s_mode; }
 String wifi_ip_string() {
@@ -44,6 +54,8 @@ static void on_wifi_event_(WiFiEvent_t event, WiFiEventInfo_t info) {
             // Flag for the loop task — keep the handler short, it runs on
             // the WiFi event task and must not call WiFi.begin() directly.
             s_event_disconnected = true;
+            s_last_disc_reason = info.wifi_sta_disconnected.reason;
+            s_last_disc_logged = false;
             break;
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
             s_event_disconnected = false;
@@ -52,6 +64,31 @@ static void on_wifi_event_(WiFiEvent_t event, WiFiEventInfo_t info) {
             break;
         default:
             break;
+    }
+}
+
+// Map a wifi_err_reason_t value to a short human label. Covers the
+// codes we actually see in the field — auth failure, deauth, beacon
+// timeout, handshake timeout, AP not found, plus a generic fallback.
+static const char* disc_reason_label_(uint8_t reason) {
+    switch (reason) {
+        case 1:   return "UNSPECIFIED";
+        case 2:   return "AUTH_EXPIRE";
+        case 3:   return "AUTH_LEAVE";
+        case 4:   return "ASSOC_EXPIRE";
+        case 5:   return "ASSOC_TOOMANY";
+        case 6:   return "NOT_AUTHED";
+        case 7:   return "NOT_ASSOCED";
+        case 8:   return "ASSOC_LEAVE";
+        case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
+        case 16:  return "GROUP_KEY_UPDATE_TIMEOUT";
+        case 200: return "BEACON_TIMEOUT";
+        case 201: return "NO_AP_FOUND";
+        case 202: return "AUTH_FAIL";
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        case 205: return "CONNECTION_FAIL";
+        default:  return "?";
     }
 }
 
@@ -73,10 +110,15 @@ static void start_ap_() {
     mac.replace(":", "");
     s_ap_ssid = String("HoneyOpus-") + mac.substring(8);
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(s_ap_ssid.c_str(), s_ap_pass.c_str());
+    // softAPConfig() MUST come before softAP() — calling it after has been
+    // observed on certain arduino-esp32 versions to leave the AP listening
+    // on the framework default (192.168.4.1 most of the time, but not
+    // always) and the captive portal then advertises the wrong IP. See
+    // ESP32 stability review W5.
     IPAddress ap_ip(192, 168, 4, 1);
     IPAddress ap_nm(255, 255, 255, 0);
     WiFi.softAPConfig(ap_ip, ap_ip, ap_nm);
+    WiFi.softAP(s_ap_ssid.c_str(), s_ap_pass.c_str());
     if (s_dns_running) { s_dns.stop(); s_dns_running = false; }
     s_dns.setErrorReplyCode(DNSReplyCode::NoError);
     s_dns.start(53, "*", ap_ip);
@@ -124,6 +166,17 @@ void wifi_loop() {
 
     auto status = WiFi.status();
 
+    // Surface the last STA disconnect reason exactly once per occurrence.
+    // Lets the operator distinguish "wrong password" (AUTH_FAIL) from
+    // "router rebooted" (BEACON_TIMEOUT) from "AP gone" (NO_AP_FOUND)
+    // without grepping ESP-IDF headers. See ESP32 stability review W1.
+    if (!s_last_disc_logged) {
+        uint8_t r = s_last_disc_reason;
+        s_last_disc_logged = true;
+        Serial.printf("[wifi] STA disconnect reason=%u (%s)\n",
+                      (unsigned)r, disc_reason_label_(r));
+    }
+
     // Event-driven disconnect path — fires immediately on Reason 6/8/15
     // etc., without waiting for status() polling to catch up.
     if (s_event_disconnected && s_mode == NetMode::OnlineSTA) {
@@ -168,17 +221,26 @@ void wifi_loop() {
             // after GOT_IP, handled in the event callback). Letting
             // status()==WL_CONNECTED alone refresh it is what hid 6 hours
             // of LWIP-stuck silence in the wild.
-            if (millis() - s_last_probe > kProbeIntervalMs) {
+            // Outbound probe is observability-only by default. Many
+            // routers don't accept TCP/53 on the gateway IP, so a
+            // fail-count threshold would kick perfectly healthy
+            // networks every few minutes (W4 in the stability review).
+            // Operators who want the historical "kick STA on probe
+            // fails" behaviour can enable wifi_probe_kick.
+            const auto& cfg = g_config.get();
+            if (cfg.wifi_probe_enabled &&
+                millis() - s_last_probe > kProbeIntervalMs) {
                 s_last_probe = millis();
                 if (probe_outbound_()) {
                     s_probe_fails = 0;
                     s_last_healthy = millis();
                 } else {
                     s_probe_fails++;
-                    Serial.printf("[wifi] probe failed (%u/%u) gw=%s\n",
+                    Serial.printf("[wifi] probe failed (%u/%u) gw=%s%s\n",
                                   (unsigned)s_probe_fails, (unsigned)kProbeFailLimit,
-                                  WiFi.gatewayIP().toString().c_str());
-                    if (s_probe_fails >= kProbeFailLimit) {
+                                  WiFi.gatewayIP().toString().c_str(),
+                                  cfg.wifi_probe_kick ? "" : " (observability-only)");
+                    if (cfg.wifi_probe_kick && s_probe_fails >= kProbeFailLimit) {
                         Serial.println("[wifi] probe-stuck — kicking STA");
                         s_probe_fails = 0;
                         WiFi.disconnect(false, true);
@@ -204,8 +266,7 @@ void wifi_loop() {
         (millis() - s_last_healthy) > kWifiOutageRebootMs) {
         Serial.printf("[wifi] outage > %u s, rebooting to recover\n",
                       (unsigned)(kWifiOutageRebootMs / 1000));
-        delay(100);
-        ESP.restart();
+        restart::restart_with(restart::kReasonWifiOutage);
     }
 }
 

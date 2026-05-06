@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>
 #include <vector>
 
 namespace honeyopus {
@@ -112,9 +113,28 @@ bool geoip_lookup(AttackEntry& e) {
         url = url.substring(0, idx) + e.ip + url.substring(idx + 4);
     }
 
+    // Heap gate. mbedTLS handshake (HTTPS endpoints) needs ~30-50 KB of
+    // contiguous heap; plain HTTP is much cheaper but HTTPClient still
+    // allocates response buffers. Skipping when heap is fragmented
+    // protects the rest of the system from a fail-fast cascade —
+    // geoip is best-effort metadata, not a load-bearing path. See
+    // ESP32 stability review E4.
+    const bool tls_url = url.startsWith("https://");
+    const size_t need_heap   = tls_url ? 32u * 1024u : 12u * 1024u;
+    const size_t need_largest = tls_url ? 24u * 1024u :  8u * 1024u;
+    size_t free_heap = ESP.getFreeHeap();
+    size_t largest   = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    if (free_heap < need_heap || largest < need_largest) {
+        Serial.printf("[geoip] skip — heap low (free=%u largest=%u need=%u/%u tls=%s)\n",
+                      (unsigned)free_heap, (unsigned)largest,
+                      (unsigned)need_heap, (unsigned)need_largest,
+                      tls_url ? "yes" : "no");
+        return false;
+    }
+
     HTTPClient http;
     bool ok = false;
-    if (url.startsWith("https://")) {
+    if (tls_url) {
         WiFiClientSecure cs;
         cs.setInsecure();
         ok = http.begin(cs, url);

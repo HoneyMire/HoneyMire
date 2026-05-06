@@ -6,6 +6,7 @@ AttackerGate g_gate;
 
 bool AttackerGate::admit(const String& ip) {
     if (ip.length() == 0) return true;
+    Lock l(mux_);
     uint32_t now = millis();
     for (auto& s : slots_) {
         if (s.ip == ip && s.last_ms != 0 &&
@@ -18,6 +19,7 @@ bool AttackerGate::admit(const String& ip) {
 
 void AttackerGate::touch(const String& ip) {
     if (ip.length() == 0) return;
+    Lock l(mux_);
     uint32_t now = millis();
     // First pass: existing slot for this IP -> refresh.
     for (auto& s : slots_) {

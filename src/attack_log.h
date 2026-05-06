@@ -43,6 +43,7 @@ struct AttackEntry {
     bool     reported_abuseipdb = false;
     bool     reported_otx = false;
     bool     reported_hub = false;
+    bool     reported_dshield = false;
 
     void toJson(JsonObject o) const;
     static AttackEntry fromJson(JsonObjectConst o);
