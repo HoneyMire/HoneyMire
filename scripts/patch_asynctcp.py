@@ -25,13 +25,28 @@ import sys
 SENTINEL = "// HoneyOpus: null-check malloc patch v3\n"
 
 
-def patch_file(path: str) -> bool:
+# Minimum patch coverage we expect on a clean source. If any of these
+# numbers come up short, the build aborts — either an upstream rewrite
+# changed the patch targets or someone bumped AsyncTCP-esphome and
+# we're now linking unpatched lwIP callbacks. Either case warrants a
+# loud failure rather than a silent regression. See ESP32 stability
+# review B1.
+MIN_MALLOC_GUARDS  = 6   # one per entry in fn_returns
+MIN_STATIC_GUARDS  = 4
+MIN_RECVED_PATCHES = 1
+
+
+def patch_file(path: str):
+    """Returns (patched: bool, malloc_n: int, static_n: int, recved_n: int).
+    For an already-patched file we return (False, expected counts) so the
+    caller treats it as success. Raises FileNotFoundError if the target
+    isn't on disk."""
     if not os.path.isfile(path):
-        return False
+        raise FileNotFoundError(path)
     with open(path, "r", encoding="utf-8") as f:
         src = f.read()
     if SENTINEL in src:
-        return False
+        return (False, MIN_MALLOC_GUARDS, MIN_STATIC_GUARDS, MIN_RECVED_PATCHES)
 
     pattern = re.compile(
         r"(    lwip_event_packet_t \* e = \(lwip_event_packet_t \*\)malloc\(sizeof\(lwip_event_packet_t\)\);\n)"
@@ -53,6 +68,7 @@ def patch_file(path: str) -> bool:
 
     out = []
     last = 0
+    malloc_n = 0
     fn_re = re.compile(r"\b(_tcp_[a-z_]+)\s*\(", re.MULTILINE)
 
     # Walk each malloc, find the enclosing function name by scanning backwards.
@@ -72,6 +88,7 @@ def patch_file(path: str) -> bool:
         out.append(src[last:m.end()])
         out.append("    " + guard)
         last = m.end()
+        malloc_n += 1
     out.append(src[last:])
     new_src = "".join(out)
 
@@ -90,9 +107,14 @@ def patch_file(path: str) -> bool:
         ("int8_t AsyncClient::_s_lwip_fin(void * arg, struct tcp_pcb * pcb, int8_t err) {\n",
          "    if (!arg) { return ERR_OK; }\n"),
     ]
+    static_n = 0
     for sig, guard in static_guards:
         if sig in new_src and (sig + guard) not in new_src:
             new_src = new_src.replace(sig, sig + guard, 1)
+            static_n += 1
+        elif sig in new_src and (sig + guard) in new_src:
+            # Already-applied counts as covered.
+            static_n += 1
 
     # Third pass: clamp _tcp_recved_api against the lwIP
     #   tcp_update_rcv_ann_wnd: new_rcv_ann_wnd <= 0xffff
@@ -130,16 +152,20 @@ def patch_file(path: str) -> bool:
         "    return msg->err;\n"
         "}\n"
     )
+    recved_n = 0
     if old_recved in new_src:
         new_src = new_src.replace(old_recved, new_recved, 1)
+        recved_n = 1
+    elif new_recved in new_src:
+        recved_n = 1
 
     if new_src == src:
-        return False
+        return (False, malloc_n, static_n, recved_n)
 
     new_src = SENTINEL + new_src
     with open(path, "w", encoding="utf-8") as f:
         f.write(new_src)
-    return True
+    return (True, malloc_n, static_n, recved_n)
 
 
 def main():
@@ -148,11 +174,45 @@ def main():
         os.path.join(project_dir, ".pio", "libdeps", env["PIOENV"],  # noqa: F821
                      "AsyncTCP-esphome", "src", "AsyncTCP.cpp"),
     ]
+    found_any = False
     for path in candidates:
-        if patch_file(path):
-            print(f"[honeyopus] patched {path}")
-        elif os.path.isfile(path):
-            print(f"[honeyopus] {path} already patched")
+        try:
+            patched, malloc_n, static_n, recved_n = patch_file(path)
+        except FileNotFoundError:
+            continue
+        found_any = True
+        if patched:
+            print(f"[honeyopus] patched {path} "
+                  f"(malloc_guards={malloc_n} static_guards={static_n} "
+                  f"recved={recved_n})")
+        else:
+            print(f"[honeyopus] {path} already patched "
+                  f"(malloc_guards={malloc_n} static_guards={static_n} "
+                  f"recved={recved_n})")
+        # Verify coverage. A library bump that drops or rewrites any of
+        # the patch targets must fail the build, not silently link an
+        # unpatched AsyncTCP. See ESP32 stability review B1.
+        problems = []
+        if malloc_n < MIN_MALLOC_GUARDS:
+            problems.append(
+                f"malloc null-checks: {malloc_n} applied, expected >={MIN_MALLOC_GUARDS}")
+        if static_n < MIN_STATIC_GUARDS:
+            problems.append(
+                f"static dispatcher guards: {static_n}, expected >={MIN_STATIC_GUARDS}")
+        if recved_n < MIN_RECVED_PATCHES:
+            problems.append(
+                f"_tcp_recved_api clamp: {recved_n}, expected >={MIN_RECVED_PATCHES}")
+        if problems:
+            print("[honeyopus] AsyncTCP patch coverage check FAILED:",
+                  file=sys.stderr)
+            for p in problems:
+                print(f"    - {p}", file=sys.stderr)
+            print("    library may have been updated; revisit "
+                  "scripts/patch_asynctcp.py", file=sys.stderr)
+            sys.exit(1)
+    if not found_any:
+        print("[honeyopus] AsyncTCP source not found in .pio/libdeps — "
+              "first build will retry once the library is downloaded.")
 
 
 main()

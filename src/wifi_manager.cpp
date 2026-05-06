@@ -41,6 +41,52 @@ static volatile bool    s_last_disc_logged   = true;
 // On boot we don't yet have a reason to report; flip false the first
 // time the handler captures one so wifi_loop() can surface it.
 
+// Reconnect FSM (W2 / W3 in the stability review). We deliberately do
+// NOT use WiFi.setAutoReconnect(true): the driver-side auto-reconnect
+// runs concurrently with our explicit retries, which on certain APs
+// produces a back-and-forth churn (manual disconnect → driver auto
+// reconnects → we disconnect again …) and racks up spurious AUTH_FAIL
+// noise. Instead we own the policy:
+//
+//   - On a transient drop (BEACON_TIMEOUT, NOT_AUTHED, ASSOC_LEAVE,
+//     4WAY_HANDSHAKE_TIMEOUT, …) we apply an exponential backoff
+//     between WiFi.begin() retries, capping at kBackoffMaxMs.
+//   - On a config-permanent reason (NO_AP_FOUND, AUTH_FAIL) we still
+//     retry a couple of times — the AP can be transiently absent
+//     during a router reboot — but bail to fallback AP much sooner.
+//   - On every transient-drop reconnect we use disconnect(false,
+//     /*eraseAP=*/false). The eraseAP=true form is only used on
+//     operator-driven AP fallback (wifi_force_ap) and after the
+//     reconnect FSM gives up; doing it on every glitch is heavier
+//     than necessary and can interact badly with AP roaming.
+static const uint32_t kBackoffMs[]      = { 1000, 2000, 5000, 10000, 30000, 60000 };
+static const size_t   kBackoffSteps     = sizeof(kBackoffMs) / sizeof(kBackoffMs[0]);
+static const uint32_t kBackoffMaxMs     = kBackoffMs[kBackoffSteps - 1];
+static const uint32_t kAttemptWaitMs    = 20000;  // how long to let WiFi.begin try before declaring fail
+// Bail to fallback AP after this many failed STA attempts. For auth-permanent
+// reasons we use the lower threshold so we surface the config error fast.
+static const uint8_t  kStaAttemptsTransient = 6;
+static const uint8_t  kStaAttemptsPermanent = 2;
+// Earliest absolute millis() the next WiFi.begin() retry is allowed.
+// Updated whenever an attempt times out.
+static uint32_t s_next_retry_ms = 0;
+
+static bool reason_is_permanent_(uint8_t r) {
+    // Auth-class failures and "AP not found" indicate a config problem
+    // or a vanished AP. Worth bailing to portal mode after a couple of
+    // tries instead of pounding the radio.
+    return r == 201 /*NO_AP_FOUND*/ ||
+           r == 202 /*AUTH_FAIL*/   ||
+           r == 203 /*ASSOC_FAIL*/;
+}
+
+static uint32_t backoff_for_(uint8_t attempts) {
+    if (attempts == 0) return 0;
+    size_t idx = attempts - 1;
+    if (idx >= kBackoffSteps) idx = kBackoffSteps - 1;
+    return kBackoffMs[idx];
+}
+
 NetMode wifi_mode() { return s_mode; }
 String wifi_ip_string() {
     if (s_mode == NetMode::FallbackAP) return WiFi.softAPIP().toString();
@@ -152,12 +198,16 @@ void wifi_try_sta() {
 
 void wifi_begin() {
     WiFi.persistent(false);
-    WiFi.setAutoReconnect(true);
+    // setAutoReconnect(true) was removed — see the reconnect-FSM
+    // comment block. Driver-side auto-reconnect raced with our
+    // manual retries on certain APs.
+    WiFi.setAutoReconnect(false);
     WiFi.onEvent(on_wifi_event_);
     s_last_healthy = millis();
     s_last_probe = millis();
     s_probe_fails = 0;
     s_event_disconnected = false;
+    s_next_retry_ms = 0;
     wifi_try_sta();
 }
 
@@ -177,15 +227,20 @@ void wifi_loop() {
                       (unsigned)r, disc_reason_label_(r));
     }
 
-    // Event-driven disconnect path — fires immediately on Reason 6/8/15
-    // etc., without waiting for status() polling to catch up.
+    // Event-driven disconnect path. We don't disconnect/erase here —
+    // the FSM below drives the reconnect with backoff and reason-aware
+    // bail-out. Just transition to ConnectingSTA so the next pass picks
+    // it up.
     if (s_event_disconnected && s_mode == NetMode::OnlineSTA) {
-        Serial.println("[wifi] event: STA disconnected, forcing reconnect");
+        Serial.println("[wifi] event: STA disconnected, will retry");
         s_mode = NetMode::ConnectingSTA;
         s_attempts = 0;
         s_event_disconnected = false;
-        WiFi.disconnect(false, true);
-        wifi_try_sta();
+        // No eraseAP — transient drops shouldn't churn the driver's AP
+        // record (W3). The radio remains in STA mode; we just need
+        // WiFi.begin to fire again once the backoff window opens.
+        WiFi.disconnect(false, /*eraseAP=*/false);
+        s_next_retry_ms = millis();   // first retry: no backoff
         return;
     }
 
@@ -198,22 +253,46 @@ void wifi_loop() {
             Serial.printf("[wifi] STA connected ip=%s\n", WiFi.localIP().toString().c_str());
             g_display.showStatus("Online", g_config.get().wifi_ssid, WiFi.localIP().toString());
             g_display.wakeFromButton();
-        } else if (millis() - s_last_attempt > 25000) {
-            // give up STA attempts, drop to AP after 3
-            if (s_attempts >= 3) start_ap_();
-            else wifi_try_sta();
+        } else if (s_attempts == 0) {
+            // No begin() fired yet (we landed here via the event path).
+            // Honor the backoff window before retrying.
+            if (millis() >= s_next_retry_ms) wifi_try_sta();
+        } else if (millis() - s_last_attempt > kAttemptWaitMs) {
+            // Attempt timed out. Decide whether to keep trying or bail
+            // to AP fallback, using the last observed reason as a hint.
+            const uint8_t reason  = s_last_disc_reason;
+            const bool    perm    = reason_is_permanent_(reason);
+            const uint8_t cap     = perm ? kStaAttemptsPermanent : kStaAttemptsTransient;
+            if (s_attempts >= cap) {
+                Serial.printf("[wifi] giving up STA after %u attempts (%s reason=%u %s) — fallback AP\n",
+                              (unsigned)s_attempts, perm ? "permanent" : "transient",
+                              (unsigned)reason, disc_reason_label_(reason));
+                start_ap_();
+            } else {
+                uint32_t wait = backoff_for_(s_attempts);
+                if (wait > kBackoffMaxMs) wait = kBackoffMaxMs;
+                s_next_retry_ms = millis() + wait;
+                Serial.printf("[wifi] attempt %u failed, backoff %ums (reason=%u %s)\n",
+                              (unsigned)s_attempts, (unsigned)wait,
+                              (unsigned)reason, disc_reason_label_(reason));
+                if (millis() >= s_next_retry_ms) wifi_try_sta();
+            }
+        } else if (s_next_retry_ms != 0 && millis() >= s_next_retry_ms &&
+                   millis() - s_last_attempt > kAttemptWaitMs) {
+            // Backoff elapsed and last begin() has had its chance.
+            wifi_try_sta();
         }
     } else if (s_mode == NetMode::OnlineSTA) {
         if (status != WL_CONNECTED) {
-            // Will auto-reconnect; if that fails for 30 s, fall back.
-            if (millis() - s_last_attempt > 30000) {
-                Serial.println("[wifi] STA lost, retrying...");
-                // Force a clean STA stack — AutoReconnect alone has been
-                // observed to silently stay in WL_DISCONNECTED forever after
-                // certain router-side de-auths (e.g. Reason 6 NOT_AUTHED).
-                WiFi.disconnect(false, true);
+            // Polled detection of a missed disconnect event. Same
+            // policy as the event path: retire to ConnectingSTA, no
+            // eraseAP.
+            if (millis() - s_last_attempt > kAttemptWaitMs) {
+                Serial.println("[wifi] STA lost (polled), will retry");
+                WiFi.disconnect(false, /*eraseAP=*/false);
+                s_mode = NetMode::ConnectingSTA;
                 s_attempts = 0;
-                wifi_try_sta();
+                s_next_retry_ms = millis();
             }
         } else {
             s_last_attempt = millis();
@@ -243,10 +322,12 @@ void wifi_loop() {
                     if (cfg.wifi_probe_kick && s_probe_fails >= kProbeFailLimit) {
                         Serial.println("[wifi] probe-stuck — kicking STA");
                         s_probe_fails = 0;
-                        WiFi.disconnect(false, true);
+                        // eraseAP=false — see W3. Even on probe-stuck
+                        // we don't need to forget the configured AP.
+                        WiFi.disconnect(false, /*eraseAP=*/false);
                         s_mode = NetMode::ConnectingSTA;
                         s_attempts = 0;
-                        wifi_try_sta();
+                        s_next_retry_ms = millis();
                     }
                 }
             }

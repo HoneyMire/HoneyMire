@@ -1,9 +1,18 @@
 #include "restart_reason.h"
 
 #include <Preferences.h>
+#include <esp_attr.h>
 
 namespace honeyopus {
 namespace restart {
+
+// RTC slow-memory breadcrumb. Marked RTC_NOINIT_ATTR so it survives a
+// software reset (panic, esp_restart) without being zero'd by the
+// startup code. A canary distinguishes "we crashed mid-loop" from
+// "this is a fresh power cycle" (where the SRAM contents are random).
+static RTC_NOINIT_ATTR const char* s_bc_tag;
+static RTC_NOINIT_ATTR uint32_t    s_bc_canary;
+static constexpr uint32_t          kBcCanary = 0xC0FFEE42;
 
 // NVS namespace + key shape:
 //   "rstr" / "last"            → last reason label (string)
@@ -50,6 +59,25 @@ void log_on_boot() {
     }
     Serial.println();
     p.end();
+}
+
+void breadcrumb(const char* tag) {
+    s_bc_tag = tag;
+    s_bc_canary = kBcCanary;
+}
+
+void breadcrumb_log_on_boot() {
+    if (s_bc_canary != kBcCanary || s_bc_tag == nullptr) {
+        Serial.println("[breadcrumb] cold boot (no prior section recorded)");
+        s_bc_canary = 0;
+        s_bc_tag = nullptr;
+        return;
+    }
+    Serial.printf("[breadcrumb] last loop section before reset: %s\n", s_bc_tag);
+    // Clear the canary so the next boot's log doesn't re-print stale
+    // info if this boot finishes setup() and never enters loop().
+    s_bc_canary = 0;
+    s_bc_tag = nullptr;
 }
 
 [[noreturn]] void restart_with(const char* reason) {

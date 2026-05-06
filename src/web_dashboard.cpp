@@ -979,6 +979,17 @@ static void api_attacks(AsyncWebServerRequest* req) {
 static void api_scan(AsyncWebServerRequest* req) {
     int n = WiFi.scanComplete();
     if (n == WIFI_SCAN_FAILED || n == -2) {
+        // Setup portal runs in AP-only mode by default. Active STA scans
+        // from a pure-AP role have been observed to interrupt beacon
+        // transmission and disconnect captive-portal clients on certain
+        // arduino-esp32 versions. Switch to AP+STA for the scan; we
+        // stay in AP+STA for the lifetime of the portal session, which
+        // is fine — the STA half stays unconnected while no
+        // credentials are saved. See ESP32 stability review W6.
+        if (wifi_mode() == NetMode::FallbackAP &&
+            WiFi.getMode() != WIFI_AP_STA) {
+            WiFi.mode(WIFI_AP_STA);
+        }
         WiFi.scanNetworks(true, false, false, 250);
         req->send(202, "application/json", "{\"scanning\":true}");
         return;

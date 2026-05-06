@@ -30,5 +30,21 @@ void log_on_boot();
 // Stamp the reason in NVS, then ESP.restart(). Does not return.
 [[noreturn]] void restart_with(const char* reason);
 
+// Loop-section breadcrumb. Update before each section in loop() so a
+// WDT panic / hard fault leaves a trail: the next boot can print which
+// section was running just before the reset. Stored in RTC slow memory,
+// so it survives software resets but not full power cycles.
+//
+// `tag` MUST point to a string literal (or any address that's stable
+// across resets — flash addresses are). We store the pointer directly,
+// not a copy, to keep the per-call cost a single 32-bit write.
+//
+// See ESP32 stability review WD1.
+void breadcrumb(const char* tag);
+
+// Print the last breadcrumb captured before the previous reset, if
+// any. Call once from setup(), right after log_on_boot().
+void breadcrumb_log_on_boot();
+
 } // namespace restart
 } // namespace honeyopus

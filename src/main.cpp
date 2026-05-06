@@ -82,6 +82,8 @@ void setup() {
     Serial.println();
     Serial.println("==== HoneyOpus booting (" HONEYOPUS_BOARD_NAME ") ====");
     restart::log_on_boot();
+    restart::breadcrumb_log_on_boot();
+    restart::breadcrumb("setup");
     Serial.printf("chip: %s rev=%u  cpu=%uMHz  free_heap=%u\n",
                   ESP.getChipModel(), ESP.getChipRevision(),
                   ESP.getCpuFreqMHz(), ESP.getFreeHeap());
@@ -154,8 +156,15 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+    // Section breadcrumbs — see ESP32 stability review WD1. The tag is
+    // stamped to RTC slow memory before each call; if a WDT panic or
+    // hard fault hits inside one of these, the next boot's log shows
+    // which section was running. Cost: one 32-bit write per section.
+    restart::breadcrumb("serial");
     serial_menu_loop();
+    restart::breadcrumb("wifi");
     wifi_loop();
+    restart::breadcrumb("display");
     g_display.loop();
 
     // Periodic health beacon. Without this, when the user reports "web is
@@ -170,6 +179,7 @@ void loop() {
     static uint32_t last_reap = 0;
     if (now - last_reap > 1000) {
         last_reap = now;
+        restart::breadcrumb("telnet_reap");
         telnet_reap();
     }
 
@@ -216,5 +226,6 @@ void loop() {
         low_heap_since = 0;
     }
 
+    restart::breadcrumb("idle");
     delay(5);
 }
