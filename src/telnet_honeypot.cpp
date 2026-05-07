@@ -16,6 +16,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <new>   // std::nothrow for fault-tolerant heap allocations
 #include <time.h>
 
 namespace honeyopus {
@@ -52,10 +54,19 @@ struct TnFinalizeJob {
     //   session struct leaks (~hundreds of bytes), but the cast FD is
     //   freed and the slot opens up. Far better than the old escalate-
     //   to-reboot path. See ESP32 stability review H1/H2 follow-up.
-    enum Kind : uint8_t { K_FINALIZE, K_CLOSE, K_STUCK_FINALIZE };
+    // K_INPUT_LINE: P_SHELL line ready, defer shell.execute() to the
+    //   worker. shell.execute() can take 50-150 ms (parse + simulated
+    //   filesystem + payload-realism), and running it inline on
+    //   tn_on_data was the residual H3 bottleneck after H4 fixed the
+    //   send blocker. Worker calls shell.execute(), then tn_send()s
+    //   the response and the next prompt — both via the cross-task-
+    //   safe out_buf path. `line` is heap-allocated by tn_handle_
+    //   complete_line; the worker frees it.
+    enum Kind : uint8_t { K_FINALIZE, K_CLOSE, K_STUCK_FINALIZE, K_INPUT_LINE };
     Kind kind;
-    void* sess;            // valid when kind == K_FINALIZE / K_STUCK_FINALIZE
-    AsyncClient* client;   // valid when kind == K_CLOSE
+    void* sess;            // K_FINALIZE / K_STUCK_FINALIZE / K_INPUT_LINE
+    AsyncClient* client;   // K_CLOSE
+    String* line;          // K_INPUT_LINE only — owned by the job, worker frees
 };
 static QueueHandle_t s_finalize_q = nullptr;
 
@@ -133,6 +144,10 @@ struct TnSession {
     // peer can't grow this unbounded.
     String   out_buf;
     size_t   out_dropped = 0;    // bytes dropped because the cap was hit
+    // Guards out_buf for the H3 hand-off: worker task (running
+    // shell.execute → tn_send) and AsyncTCP task (onAck/onPoll →
+    // tn_pump_out_) both touch it. Created in tn_on_client.
+    SemaphoreHandle_t out_mux = nullptr;
 };
 static constexpr size_t kTnOutboundCap = 16 * 1024;
 
@@ -140,51 +155,71 @@ static constexpr size_t kTnOutboundCap = 16 * 1024;
 // — accepts whatever space() returns this call and returns. The
 // AsyncTCP poll callback fires periodically and onAck fires on every
 // peer ACK, both of which call this; head-of-line blocking is gone.
-// Caller must NOT hold any AsyncTCP-internal lock that close() would
-// reacquire — calling from tn_on_data, tn_on_poll, tn_on_ack is fine.
+//
+// The H3 hand-off makes this race-able: the worker task calls tn_send
+// (appending to out_buf) while AsyncTCP onAck/onPoll concurrently
+// call tn_pump_out_ (reading + removing from out_buf). out_mux
+// serializes both. We snapshot bytes under the lock into a small
+// stack buffer, drop the lock, call AsyncClient::add (which can take
+// tens of µs because it crosses into the lwIP context), then re-take
+// the lock to remove the consumed prefix. This keeps the critical
+// section short.
 static void tn_pump_out_(TnSession* s) {
-    if (!s || !s->client || s->out_buf.length() == 0) return;
+    if (!s || !s->client) return;
     if (!s->client->connected()) {
-        // Peer is gone — drop pending bytes so we don't hold heap
-        // until finalize.
+        if (s->out_mux) xSemaphoreTake(s->out_mux, portMAX_DELAY);
         s->out_buf = String();
+        if (s->out_mux) xSemaphoreGive(s->out_mux);
         return;
     }
     size_t space = s->client->space();
     if (space == 0) return;
+    char tmp[1024];
+    size_t take = 0;
+    if (s->out_mux) xSemaphoreTake(s->out_mux, portMAX_DELAY);
     size_t avail = s->out_buf.length();
-    size_t chunk = (avail < space) ? avail : space;
-    size_t added = s->client->add(s->out_buf.c_str(), chunk, ASYNC_WRITE_FLAG_COPY);
+    if (avail) {
+        take = avail;
+        if (take > space)        take = space;
+        if (take > sizeof(tmp))  take = sizeof(tmp);
+        memcpy(tmp, s->out_buf.c_str(), take);
+    }
+    if (s->out_mux) xSemaphoreGive(s->out_mux);
+    if (!take) return;
+    size_t added = s->client->add(tmp, take, ASYNC_WRITE_FLAG_COPY);
     if (added == 0) return;
     s->client->send();
-    // Pop the consumed prefix. String::remove() with offset 0 + len
-    // copies the tail back to the start — O(n) but the tail is
-    // typically small.
-    s->out_buf.remove(0, added);
+    if (s->out_mux) xSemaphoreTake(s->out_mux, portMAX_DELAY);
+    // The buffer can only have grown (concat tail) since we snapshotted;
+    // the head bytes we just sent are still at offset 0.
+    if (s->out_buf.length() >= added) s->out_buf.remove(0, added);
+    else                              s->out_buf = String();
+    if (s->out_mux) xSemaphoreGive(s->out_mux);
 }
 
-// Append bytes to the outbound ring and try one non-blocking drain.
-// Replaces the old vTaskDelay-up-to-4s loop. record=false suppresses
-// asciinema recording (used for IAC negotiation noise + per-char
-// echoes during line editing).
+// Append bytes to the outbound ring. Safe to call from either the
+// AsyncTCP task (e.g. tn_handle_complete_line for auth phase) or the
+// worker task (shell.execute response, prompts). Does NOT call
+// tn_pump_out_ inline — to avoid recursive lock acquisition. Drains
+// happen via onPoll, onAck, and an explicit pump at the end of
+// tn_on_data so latency stays low for the AsyncTCP-driven path.
+// record=false suppresses asciinema recording (used for IAC
+// negotiation noise + per-char echoes during line editing).
 static void tn_send(TnSession* s, const char* data, size_t n, bool record = true) {
     if (!s || !s->client || !data || n == 0) return;
     if (record) s->cast.out(data, n);
-    // Cap the ring so a stuck peer can't drag the heap down. Anything
-    // past the cap is dropped — the attacker missing a tail of MOTD
-    // is preferable to OOMing the device.
+    if (s->out_mux) xSemaphoreTake(s->out_mux, portMAX_DELAY);
     size_t cur = s->out_buf.length();
     if (cur >= kTnOutboundCap) {
         s->out_dropped += n;
+        if (s->out_mux) xSemaphoreGive(s->out_mux);
         return;
     }
     size_t room = kTnOutboundCap - cur;
     size_t take = (n < room) ? n : room;
     if (take < n) s->out_dropped += (n - take);
     s->out_buf.concat(data, take);
-    // Best-effort drain inline. If space() is 0, we just hold the
-    // bytes and the next poll/ack callback will pick them up.
-    tn_pump_out_(s);
+    if (s->out_mux) xSemaphoreGive(s->out_mux);
 }
 
 static void tn_send(TnSession* s, const String& str) {
@@ -265,6 +300,21 @@ static void tn_handle_complete_line(TnSession* s) {
         return;
     }
     if (s->phase == TnSession::P_SHELL) {
+        // H3: defer shell.execute() to the worker so the AsyncTCP
+        // task can return promptly. The line text is copied to the
+        // heap; the worker frees it.
+        String* line_heap = new (std::nothrow) String(line);
+        if (line_heap && s_finalize_q) {
+            TnFinalizeJob j{};
+            j.kind   = TnFinalizeJob::K_INPUT_LINE;
+            j.sess   = s;
+            j.client = nullptr;
+            j.line   = line_heap;
+            if (xQueueSend(s_finalize_q, &j, 0) == pdTRUE) return;
+        }
+        // Heap or queue full — fall back to inline execution. Better
+        // a brief AsyncTCP stall than to drop attacker input.
+        delete line_heap;
         String out = s->shell.execute(line);
         if (out.length()) tn_send(s, out);
         if (s->shell.exitRequested() || s->shell.sessionLimitsExceeded()) {
@@ -323,6 +373,29 @@ static void tn_worker_task(void*) {
             // Don't `delete s;` — AsyncTCP may still hold its arg.
             if (s_active > 0) s_active--;
             g_gate.setTelnetActive(s_active);
+            continue;
+        }
+        if (j.kind == TnFinalizeJob::K_INPUT_LINE) {
+            // Shell command from a P_SHELL session. shell.execute()
+            // synthesizes the response (50-150 ms typical, longer for
+            // a payload-realism path); doing it here keeps the
+            // AsyncTCP task free for the next packet.
+            TnSession* s = (TnSession*)j.sess;
+            String* line = j.line;
+            if (s && !s->finalized && line) {
+                String out = s->shell.execute(*line);
+                if (out.length()) tn_send(s, out);
+                if (s->shell.exitRequested() || s->shell.sessionLimitsExceeded()) {
+                    s->phase = TnSession::P_DEAD;
+                    if (s->client) s->client->close();
+                } else {
+                    tn_send(s, s->shell.prompt());
+                }
+                // Push whatever we just appended toward the wire so
+                // the attacker doesn't wait until the next onPoll.
+                tn_pump_out_(s);
+            }
+            delete line;
             continue;
         }
         // K_FINALIZE — clean disconnect path. Run the slow forensics
@@ -436,6 +509,10 @@ static void tn_on_data(void* arg, AsyncClient* /*c*/, void* data, size_t len) {
             tn_send(s, &e, 1, /*record=*/false);
         }
     }
+    // Drain whatever the auth-phase sends (and now-deferred shell
+    // responses that may have landed before us) accumulated. tn_send
+    // no longer pumps inline — see its comment block.
+    tn_pump_out_(s);
 }
 
 static void tn_on_disconnect(void* arg, AsyncClient* /*c*/) {
@@ -520,6 +597,7 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     s->t0 = millis();
     s->last_rx_ms = s->t0;
     s->persona = telnet_persona_random();  // Select random persona per connection
+    s->out_mux = xSemaphoreCreateMutex();   // guards out_buf across worker / AsyncTCP
     registry_add(s);
     s->entry.id        = g_attack_log.nextId();
     s->entry.ts        = time(nullptr);
@@ -568,7 +646,10 @@ void telnet_begin() {
     if (s_server) return;
     if (!s_finalize_q) {
         s_finalize_q = xQueueCreate(8, sizeof(TnFinalizeJob));
-        xTaskCreate(tn_worker_task, "tn_fin", 6144, nullptr, 1, nullptr);
+        // Bumped from 6144 → 8192. The worker now also runs
+        // shell.execute() (H3) which uses several stacked Strings,
+        // ArduinoJson StaticJsonDocs, and recursive command handlers.
+        xTaskCreate(tn_worker_task, "tn_fin", 8192, nullptr, 1, nullptr);
     }
     s_server = new AsyncServer(HONEYOPUS_TELNET_PORT);
     s_server->onClient(tn_on_client, nullptr);
