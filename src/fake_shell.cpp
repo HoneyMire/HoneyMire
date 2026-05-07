@@ -12,6 +12,7 @@ namespace honeyopus {
 static const uint16_t MAX_COMMANDS_PER_SESSION = 500;
 static const uint16_t MAX_CMD_LEN              = 4096;
 static const uint16_t MAX_VFS_FILES            = 64;
+static const uint16_t MAX_VPROCS               = 64;
 static const uint32_t MAX_VFILE_SIZE           = 16 * 1024;
 static const uint32_t MAX_SLEEP_MS             = 3000;
 
@@ -2598,8 +2599,12 @@ String FakeShell::cmdExecute_(Cmd& c) {
     String body; serializeJson(d,body);
     logEvent_("payload_execution", body);
 
-    // Insert a fake process for ps
-    if (procs_.size() < 64) {
+    // Insert a fake process for ps. Capped at MAX_VPROCS so a long
+    // session that runs many payload-execute steps doesn't unbounded-
+    // grow the procs_ vector. Bots running 30-50 payloads per session
+    // are routine — without this, each one added a FakeProcess that
+    // never got reaped.
+    if (procs_.size() < MAX_VPROCS) {
         FakeProcess p;
         p.pid = 1000 + (millis() & 0x1fff);
         p.user = user_;
