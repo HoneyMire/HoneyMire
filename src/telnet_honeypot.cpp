@@ -123,32 +123,68 @@ struct TnSession {
     bool     stuck_logged = false; // set once when reaper first reports leak
     uint32_t stuck_at_ms = 0;      // millis() when stuck was first detected
     bool     close_attempted = false; // reaper has tried to close() once
-};
 
-// Send `n` bytes, looping over short writes. AsyncTCP's add()/write() may
-// accept fewer bytes than asked when its internal pbuf chain is full; if we
-// don't loop, the tail of any large message (e.g. shell MOTD) is silently lost.
-// Send raw bytes to the attacker. If `record` is false the bytes are not
-// written to the asciinema cast — used for telnet IAC negotiation, which is
-// protocol noise that a real telnet client consumes silently. Recording it
-// shows up as U+FFFD replacement chars on playback.
+    // Outbound ring (ESP32 stability review H4). Bytes destined for the
+    // attacker are appended here by tn_send() and drained by
+    // tn_pump_out_() — never inline-blocked. The old loop with
+    // vTaskDelay(2) up to 4 s was the worst head-of-line blocker on
+    // the AsyncTCP task: a single slow / silent client could hold the
+    // whole task for seconds. Capped at kTnOutboundCap so a stuck
+    // peer can't grow this unbounded.
+    String   out_buf;
+    size_t   out_dropped = 0;    // bytes dropped because the cap was hit
+};
+static constexpr size_t kTnOutboundCap = 16 * 1024;
+
+// Drain bytes from the per-session outbound ring into AsyncTCP. Bounded
+// — accepts whatever space() returns this call and returns. The
+// AsyncTCP poll callback fires periodically and onAck fires on every
+// peer ACK, both of which call this; head-of-line blocking is gone.
+// Caller must NOT hold any AsyncTCP-internal lock that close() would
+// reacquire — calling from tn_on_data, tn_on_poll, tn_on_ack is fine.
+static void tn_pump_out_(TnSession* s) {
+    if (!s || !s->client || s->out_buf.length() == 0) return;
+    if (!s->client->connected()) {
+        // Peer is gone — drop pending bytes so we don't hold heap
+        // until finalize.
+        s->out_buf = String();
+        return;
+    }
+    size_t space = s->client->space();
+    if (space == 0) return;
+    size_t avail = s->out_buf.length();
+    size_t chunk = (avail < space) ? avail : space;
+    size_t added = s->client->add(s->out_buf.c_str(), chunk, ASYNC_WRITE_FLAG_COPY);
+    if (added == 0) return;
+    s->client->send();
+    // Pop the consumed prefix. String::remove() with offset 0 + len
+    // copies the tail back to the start — O(n) but the tail is
+    // typically small.
+    s->out_buf.remove(0, added);
+}
+
+// Append bytes to the outbound ring and try one non-blocking drain.
+// Replaces the old vTaskDelay-up-to-4s loop. record=false suppresses
+// asciinema recording (used for IAC negotiation noise + per-char
+// echoes during line editing).
 static void tn_send(TnSession* s, const char* data, size_t n, bool record = true) {
     if (!s || !s->client || !data || n == 0) return;
     if (record) s->cast.out(data, n);
-    size_t off = 0;
-    uint32_t deadline = millis() + 4000;
-    while (off < n && s->client->connected() && millis() < deadline) {
-        size_t space = s->client->space();
-        if (space == 0) {
-            vTaskDelay(pdMS_TO_TICKS(2));
-            continue;
-        }
-        size_t chunk = (n - off < space) ? n - off : space;
-        size_t added = s->client->add(data + off, chunk, ASYNC_WRITE_FLAG_COPY);
-        if (added == 0) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
-        s->client->send();
-        off += added;
+    // Cap the ring so a stuck peer can't drag the heap down. Anything
+    // past the cap is dropped — the attacker missing a tail of MOTD
+    // is preferable to OOMing the device.
+    size_t cur = s->out_buf.length();
+    if (cur >= kTnOutboundCap) {
+        s->out_dropped += n;
+        return;
     }
+    size_t room = kTnOutboundCap - cur;
+    size_t take = (n < room) ? n : room;
+    if (take < n) s->out_dropped += (n - take);
+    s->out_buf.concat(data, take);
+    // Best-effort drain inline. If space() is 0, we just hold the
+    // bytes and the next poll/ack callback will pick them up.
+    tn_pump_out_(s);
 }
 
 static void tn_send(TnSession* s, const String& str) {
@@ -433,6 +469,11 @@ static void tn_on_timeout(void* arg, AsyncClient* c, uint32_t /*time*/) {
 static void tn_on_poll(void* arg, AsyncClient* c) {
     auto* s = (TnSession*)arg;
     if (!s || !c || s->finalized) return;
+    // Outbound drain — fires periodically (~1 Hz default) without
+    // blocking. The combination of this + tn_on_ack means
+    // out_buf empties promptly without tn_send ever blocking the
+    // AsyncTCP task.
+    tn_pump_out_(s);
     // Idle timeout — only close if the attacker has stopped sending bytes
     // for the full window. Resets on every onData (see tn_on_data). An
     // actively-typing session lives for as long as the attacker keeps
@@ -441,6 +482,13 @@ static void tn_on_poll(void* arg, AsyncClient* c) {
     if (millis() - s->last_rx_ms > kTnIdleTimeoutMs) {
         c->close();
     }
+}
+
+static void tn_on_ack(void* arg, AsyncClient* /*c*/, size_t /*len*/, uint32_t /*time*/) {
+    auto* s = (TnSession*)arg;
+    if (!s || s->finalized) return;
+    // Peer ACKed bytes → space() just got bigger → drain.
+    tn_pump_out_(s);
 }
 
 static void tn_on_client(void* /*arg*/, AsyncClient* c) {
@@ -510,6 +558,7 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     c->onTimeout(tn_on_timeout, s);
     c->onData(tn_on_data, s);
     c->onPoll(tn_on_poll, s);
+    c->onAck(tn_on_ack, s);
 
     tn_send_iac_neg(s);
     tn_prompt_login(s);
