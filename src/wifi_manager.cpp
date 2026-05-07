@@ -31,6 +31,10 @@ static const uint8_t  kProbeFailLimit  = 3;
 static uint32_t s_last_probe = 0;
 static uint8_t  s_probe_fails = 0;
 static volatile bool s_event_disconnected = false;
+// millis() at the most recent GOT_IP. 0 while disconnected. Drives
+// wifi_online_uptime_ms() so callers can defer DNS-dependent work for
+// a few seconds after every reconnect.
+static volatile uint32_t s_online_since_ms = 0;
 // Last STA disconnect reason captured by the event handler. Logged once
 // from wifi_loop() when it changes — the event handler runs on the WiFi
 // task and must stay short. Reasons are documented in
@@ -94,6 +98,12 @@ String wifi_ip_string() {
 }
 String wifi_ap_ssid() { return s_ap_ssid; }
 
+uint32_t wifi_online_uptime_ms() {
+    uint32_t since = s_online_since_ms;
+    if (since == 0) return 0;
+    return millis() - since;
+}
+
 static void on_wifi_event_(WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
@@ -102,11 +112,13 @@ static void on_wifi_event_(WiFiEvent_t event, WiFiEventInfo_t info) {
             s_event_disconnected = true;
             s_last_disc_reason = info.wifi_sta_disconnected.reason;
             s_last_disc_logged = false;
+            s_online_since_ms = 0;
             break;
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
             s_event_disconnected = false;
             s_probe_fails = 0;
             s_last_healthy = millis();
+            s_online_since_ms = millis();
             break;
         default:
             break;

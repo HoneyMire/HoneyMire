@@ -1,5 +1,6 @@
 #include "geoip.h"
 #include "config.h"
+#include "wifi_manager.h"   // wifi_online_uptime_ms — DNS warmup gate
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -111,6 +112,24 @@ bool geoip_lookup(AttackEntry& e) {
         else url += "/" + e.ip;
     } else {
         url = url.substring(0, idx) + e.ip + url.substring(idx + 4);
+    }
+
+    // DNS warmup gate. Same rationale as the intel reporters: the
+    // first geoip request after every reconnect was emitting a
+    // [E] DNS Failed for ip-api.com line. 8 s of post-GOT_IP grace
+    // covers the resolver settle time empirically.
+    static const uint32_t kGeoDnsWarmupMs = 8000;
+    {
+        uint32_t up = wifi_online_uptime_ms();
+        if (up == 0) {
+            Serial.println("[geoip] skip — STA not online");
+            return false;
+        }
+        if (up < kGeoDnsWarmupMs) {
+            Serial.printf("[geoip] skip — STA online %ums (DNS warmup, need %ums)\n",
+                          (unsigned)up, (unsigned)kGeoDnsWarmupMs);
+            return false;
+        }
     }
 
     // Heap gate. mbedTLS handshake (HTTPS endpoints) needs ~30-50 KB of

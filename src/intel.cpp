@@ -1,6 +1,8 @@
 #include "intel.h"
 #include "config.h"
 #include "geoip.h"
+#include "storage.h"        // fs_exists_silent — silent cast-file probes
+#include "wifi_manager.h"   // wifi_online_uptime_ms — DNS warmup gate
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -32,6 +34,32 @@ static bool heap_ok_for_tls_(const char* tag) {
         Serial.printf("[%s] skip — heap low (free=%u largest=%u min=%u/%u)\n",
                       tag, (unsigned)free_heap, (unsigned)largest,
                       (unsigned)kTlsMinHeap, (unsigned)kTlsMinLargestBlk);
+        return false;
+    }
+    return true;
+}
+
+// DNS-warmup gate. The arduino-esp32 / lwIP DNS resolver sometimes
+// returns SERVFAIL for the first few seconds after STA association
+// even on healthy networks (especially noticeable right after a
+// reconnect). Without this gate, the first hub/AbuseIPDB/OTX/DShield
+// POST after every reconnect spammed
+//   [E][WiFiGeneric.cpp:1583] hostByName(): DNS Failed for ...
+//   [W][HTTPClient.cpp:1483] returnError(): error(-1): connection refused
+// — the work was retried-by-attack-volume anyway, so deferring the
+// first attempt for a few seconds saves the noise without missing
+// reports. 8 s covers the resolver warmup empirically.
+static const uint32_t kDnsWarmupMs = 8000;
+
+static bool dns_warm_for_tls_(const char* tag) {
+    uint32_t up = wifi_online_uptime_ms();
+    if (up == 0) {
+        Serial.printf("[%s] skip — STA not online\n", tag);
+        return false;
+    }
+    if (up < kDnsWarmupMs) {
+        Serial.printf("[%s] skip — STA online %ums (DNS warmup, need %ums)\n",
+                      tag, (unsigned)up, (unsigned)kDnsWarmupMs);
         return false;
     }
     return true;
@@ -133,6 +161,7 @@ bool intel_report_abuseipdb(AttackEntry& e) {
         Serial.printf("[abuseipdb] cooldown skip ip=%s\n", e.ip.c_str());
         return false;
     }
+    if (!dns_warm_for_tls_("abuseipdb")) return false;
     if (!heap_ok_for_tls_("abuseipdb")) return false;
 
     WiFiClientSecure cs;
@@ -308,6 +337,7 @@ bool intel_report_otx(AttackEntry& e) {
         Serial.printf("[otx] cooldown skip ip=%s\n", e.ip.c_str());
         return false;
     }
+    if (!dns_warm_for_tls_("otx")) return false;
     if (!heap_ok_for_tls_("otx")) return false;
 
     if (!s_otx_mtx) s_otx_mtx = xSemaphoreCreateMutex();
@@ -488,6 +518,13 @@ static String hub_build_events_(const String& cast_path,
                                 bool& truncated) {
     truncated = false;
     if (!cast_path.length() || budget_bytes == 0) return String();
+    // Silent existence check first — calling LittleFS.open(path, "r")
+    // when the file isn't there logs a noisy "[E] vfs_api.cpp:105
+    // ... no permits for creation" line. Asciinema::begin() can fail
+    // to actually create the cast file under LittleFS pressure, but
+    // entry.cast_path is still populated, so this path fires
+    // routinely and is not an error condition.
+    if (!fs_exists_silent(cast_path.c_str())) return String();
     File f = LittleFS.open(cast_path, "r");
     if (!f) return String();
 
@@ -568,6 +605,7 @@ bool intel_report_hub(AttackEntry& e) {
     if (e.reported_hub) return true;
     // Per spec §12.6: hub does NOT suppress LAN attacks.
 
+    if (!dns_warm_for_tls_("hub")) return false;
     if (!heap_ok_for_tls_("hub")) return false;
 
     // Catch the most common misconfiguration: pointing the ESP at
@@ -859,6 +897,7 @@ static void intel_dshield_drain_() {
     if (cfg.dshield_email.length() == 0 || cfg.dshield_apikey.length() == 0) return;
     if (s_dshield_pending.empty()) return;
     if (millis() < s_dshield_next_ms) return;
+    if (!dns_warm_for_tls_("dshield")) return;
     if (!heap_ok_for_tls_("dshield")) return;
 
     JsonDocument d;

@@ -480,15 +480,24 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     s->entry.port      = c->remotePort();
 
     String cast_path   = make_session_path("telnet");
-    s->cast.begin(cast_path, TN_COLS, TN_ROWS,
-                  "Telnet session from " + s->entry.ip,
-                  "/bin/login");
+    bool cast_open = s->cast.begin(cast_path, TN_COLS, TN_ROWS,
+                                   "Telnet session from " + s->entry.ip,
+                                   "/bin/login");
     // Suppress recording during the auth dance — login prompts and the
     // typed credentials are noise in the transcript. The captured
     // user/pass live on s->entry.{user,pass} already; the recorded cast
     // is for the actual shell session that follows.
     s->cast.setPaused(true);
-    s->entry.cast_path = cast_path;
+    if (cast_open) {
+        s->entry.cast_path = cast_path;
+    } else {
+        // LittleFS pressure or transient open failure. Leave
+        // entry.cast_path empty so the hub reporter and the local
+        // dashboard skip the recording cleanly instead of probing for
+        // a file that isn't there.
+        Serial.printf("[telnet] cast open failed for id=%u path=%s — recording disabled for this session\n",
+                      (unsigned)s->entry.id, cast_path.c_str());
+    }
 
     g_display.showAttack(AttackKind::Telnet);
 

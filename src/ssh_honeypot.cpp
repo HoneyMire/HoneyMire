@@ -228,16 +228,21 @@ static void handle_session(ssh_session sess) {
 
     Asciinema cast;
     String cast_path = make_session_path("ssh");
-    cast.begin(cast_path, SSH_COLS, SSH_ROWS,
-               "SSH session from " + entry.ip,
-               "/bin/bash");
+    bool cast_open = cast.begin(cast_path, SSH_COLS, SSH_ROWS,
+                                "SSH session from " + entry.ip,
+                                "/bin/bash");
     // Suppress recording until the shell phase starts. SSH auth happens
     // via libssh messages (not through the cast pipeline), so this is
     // mostly defensive — but it also means a session that gets accepted
     // but then sends junk channel-requests writes nothing to the cast.
     // run_fake_shell / the exec-mode branch flip paused→false.
     cast.setPaused(true);
-    entry.cast_path = cast_path;
+    if (cast_open) {
+        entry.cast_path = cast_path;
+    } else {
+        Serial.printf("[ssh] cast open failed for id=%u path=%s — recording disabled\n",
+                      (unsigned)entry.id, cast_path.c_str());
+    }
     uint32_t t0 = millis();
 
     if (ssh_handle_key_exchange(sess) != SSH_OK) {
