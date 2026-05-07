@@ -75,6 +75,26 @@ static const uint8_t  kStaAttemptsPermanent = 2;
 // Updated whenever an attempt times out.
 static uint32_t s_next_retry_ms = 0;
 
+// Auto-recovery from FallbackAP. Without this, a single transient
+// disconnect that exhausts the kStaAttemptsTransient retry budget
+// drops the device into FallbackAP forever — its IP becomes
+// 192.168.4.1 on its own SoftAP, NAT/port-forwarding from the
+// router stops reaching it, and the honeypot silently sees zero
+// attack traffic until rebooted. The pre-Pass-B build hid this
+// because setAutoReconnect(true) silently kept STA retries going
+// in the background; with the FSM now owning everything, AP became
+// a terminal state.
+//
+// Fix: every kApStaRetryMs while in FallbackAP, attempt STA once.
+// The existing FSM handles success (leaves AP) or failure (after
+// the standard retry budget, drops back to AP). 10 minutes is
+// short enough that a transient router reboot is recovered from
+// promptly, long enough that genuinely-bad credentials don't spam
+// AUTH_FAIL.
+static const uint32_t kApStaRetryMs    = 10UL * 60UL * 1000UL;
+static uint32_t       s_ap_since_ms    = 0;
+static uint32_t       s_last_ap_retry_ms = 0;
+
 static bool reason_is_permanent_(uint8_t r) {
     // Auth-class failures and "AP not found" indicate a config problem
     // or a vanished AP. Worth bailing to portal mode after a couple of
@@ -182,6 +202,8 @@ static void start_ap_() {
     s_dns.start(53, "*", ap_ip);
     s_dns_running = true;
     s_mode = NetMode::FallbackAP;
+    s_ap_since_ms = millis();
+    s_last_ap_retry_ms = millis();   // first STA retry kApStaRetryMs from now
     Serial.printf("[wifi] AP up SSID=%s pass=%s ip=%s\n",
                   s_ap_ssid.c_str(), s_ap_pass.c_str(), ap_ip.toString().c_str());
     g_display.showStatus("AP MODE", s_ap_ssid, ap_ip.toString());
@@ -367,6 +389,33 @@ void wifi_loop() {
         // AP itself counts as healthy — admin can still reach the
         // dashboard from the SoftAP SSID.
         s_last_healthy = millis();
+        // Periodically try STA again. A transient disconnect that
+        // exhausted the retry budget no longer pins us in AP forever:
+        // every kApStaRetryMs we attempt one more STA cycle. If it
+        // succeeds the FSM transitions out via the WL_CONNECTED
+        // branch in ConnectingSTA; if it fails we land back here and
+        // wait another kApStaRetryMs.
+        const auto& cfg = g_config.get();
+        if (cfg.wifi_ssid.length() > 0 &&
+            (millis() - s_last_ap_retry_ms) >= kApStaRetryMs) {
+            s_last_ap_retry_ms = millis();
+            // Don't bounce clients currently in the captive portal —
+            // they may be mid-credential-fix. Defer until they leave.
+            uint8_t ap_clients = WiFi.softAPgetStationNum();
+            if (ap_clients > 0) {
+                Serial.printf("[wifi] AP-retry deferred — %u portal client(s) connected\n",
+                              (unsigned)ap_clients);
+            } else {
+                uint32_t ap_secs = (millis() - s_ap_since_ms) / 1000;
+                Serial.printf("[wifi] AP-mode for %us — retrying STA\n",
+                              (unsigned)ap_secs);
+                s_attempts = 0;
+                s_next_retry_ms = 0;
+                s_event_disconnected = false;
+                wifi_try_sta();
+                return;
+            }
+        }
     }
 
     // Last-resort self-heal. If we've spent kWifiOutageRebootMs with neither
