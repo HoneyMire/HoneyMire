@@ -2,7 +2,7 @@
 #include "config.h"
 #include "telnet_persona.h"
 #include "fake_shell.h"
-#include "asciinema.h"
+#include "recorder.h"
 #include "attack_log.h"
 #include "display.h"
 #include "intel.h"
@@ -114,10 +114,10 @@ static String make_session_path(const char* proto) {
 
 // Per-connection session state. Lives on the heap; freed in onDisconnect.
 struct TnSession {
-    AsyncClient* client = nullptr;
-    AttackEntry  entry;
-    Asciinema    cast;
-    FakeShell    shell;
+    AsyncClient*    client = nullptr;
+    AttackEntry     entry;
+    SessionRecorder cast;
+    FakeShell       shell;
     TelnetPersona persona = TelnetPersona::Ubuntu;
 
     enum Phase { P_USER, P_PASS, P_SHELL, P_DEAD };
@@ -688,9 +688,16 @@ static void tn_on_client(void* /*arg*/, AsyncClient* c) {
     s->entry.port      = c->remotePort();
 
     String cast_path   = make_session_path("telnet");
-    bool cast_open = s->cast.begin(cast_path, TN_COLS, TN_ROWS,
-                                   "Telnet session from " + s->entry.ip,
-                                   "/bin/login");
+    const auto& tn_profile = telnet_persona_profile(s->persona);
+    bool cast_open = recorder_begin(s->cast, cast_path, TN_COLS, TN_ROWS,
+                                    "Telnet session from " + s->entry.ip,
+                                    "/bin/login",
+                                    s->entry.id, "telnet",
+                                    telnet_persona_name(s->persona),
+                                    tn_profile.hostname,
+                                    /* user */ String(),
+                                    /* authenticated */ false,
+                                    s->entry.ip, s->entry.port);
     // Suppress recording during the auth dance — login prompts and the
     // typed credentials are noise in the transcript. The captured
     // user/pass live on s->entry.{user,pass} already; the recorded cast

@@ -1,7 +1,7 @@
 #include "ssh_honeypot.h"
 #include "config.h"
 #include "fake_shell.h"
-#include "asciinema.h"
+#include "recorder.h"
 #include "attack_log.h"
 #include "display.h"
 #include "intel.h"
@@ -110,12 +110,12 @@ static void ssh_keygen_task(void*) {
     vTaskDelete(nullptr);
 }
 
-static void chan_write(ssh_channel chan, Asciinema& cast, const char* s, size_t n) {
+static void chan_write(ssh_channel chan, SessionRecorder& cast, const char* s, size_t n) {
     if (!chan || !s || n == 0) return;
     ssh_channel_write(chan, s, n);
     cast.out(s, n);
 }
-static void chan_write(ssh_channel chan, Asciinema& cast, const String& s) {
+static void chan_write(ssh_channel chan, SessionRecorder& cast, const String& s) {
     chan_write(chan, cast, s.c_str(), s.length());
 }
 
@@ -129,7 +129,7 @@ static void chan_write_norec(ssh_channel chan, const char* s, size_t n) {
     ssh_channel_write(chan, s, n);
 }
 
-static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entry, Asciinema& cast) {
+static void run_fake_shell(ssh_session sess, ssh_channel chan, AttackEntry& entry, SessionRecorder& cast) {
     auto& cfg = g_config.get();
     FakeShell shell;
     shell.begin(entry.user.length() ? entry.user : String(cfg.fake_user), cfg.fake_hostname);
@@ -226,11 +226,17 @@ static void handle_session(ssh_session sess) {
     entry.ip = ipbuf[0] ? String(ipbuf) : String("0.0.0.0");
     entry.port = (uint16_t)port_int;
 
-    Asciinema cast;
+    SessionRecorder cast;
     String cast_path = make_session_path("ssh");
-    bool cast_open = cast.begin(cast_path, SSH_COLS, SSH_ROWS,
-                                "SSH session from " + entry.ip,
-                                "/bin/bash");
+    bool cast_open = recorder_begin(cast, cast_path, SSH_COLS, SSH_ROWS,
+                                    "SSH session from " + entry.ip,
+                                    "/bin/bash",
+                                    entry.id, "ssh",
+                                    /* persona */ String("ssh"),
+                                    /* hostname */ String(),
+                                    /* user */ String(),
+                                    /* authenticated */ false,
+                                    entry.ip, entry.port);
     // Suppress recording until the shell phase starts. SSH auth happens
     // via libssh messages (not through the cast pipeline), so this is
     // mostly defensive — but it also means a session that gets accepted
