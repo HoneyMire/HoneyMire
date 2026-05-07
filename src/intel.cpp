@@ -614,7 +614,37 @@ static String hub_build_events_(const String& cast_path,
         if (pending_len + d_len > kHubMaxEventBytes) flush_pending();
 
         if (!pending_k) pending_k = k;
-        pending.concat(&buf[d_off], d_len);
+        // Postgres' jsonb cannot store NUL inside a text value; an
+        // INSERT of a payload containing the JSON escape " "
+        // fails with "22P05:   cannot be converted to text"
+        // and crashes the hub. Asciinema records every byte the
+        // attacker generated, and commands like `cat /proc/self/
+        // cmdline` produce NUL-delimited binary output which the
+        // cast file faithfully escapes as " ". Replace each
+        // such 6-byte sequence with "�" (U+FFFD, Unicode
+        // replacement character) so the position is preserved for
+        // forensic playback. Same byte length, so pending_len /
+        // total_d / kHubMaxEventBytes accounting is unchanged.
+        const char* p = &buf[d_off];
+        size_t i = 0;
+        while (i < d_len) {
+            // Find next " " (six chars: '\\','u','0','0','0','0').
+            size_t j = i;
+            while (j + 6 <= d_len) {
+                if (p[j]   == '\\' && p[j+1] == 'u' &&
+                    p[j+2] == '0'  && p[j+3] == '0' &&
+                    p[j+4] == '0'  && p[j+5] == '0') break;
+                j++;
+            }
+            if (j + 6 > d_len) {
+                // No more matches in scan window; copy the rest verbatim.
+                pending.concat(&p[i], d_len - i);
+                break;
+            }
+            if (j > i) pending.concat(&p[i], j - i);
+            pending.concat("\\ufffd", 6);
+            i = j + 6;
+        }
         pending_len += d_len;
         total_d     += d_len;
     }
