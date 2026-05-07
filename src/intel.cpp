@@ -519,6 +519,38 @@ static void hub_fill_hardware_(JsonObject hw) {
     hw["cpu_mhz"]  = (uint32_t)getCpuFrequencyMhz();
 }
 
+// Parse one body line of a HONEYOPUS-TRANSCRIPT/1 file:
+//   <DIR>:"<escaped-data>"
+// where DIR is 'S' (server→client = terminal output) or 'O' (client→server
+// = user input). Maps to asciicast event semantics: S→'o', O→'i'. The
+// (d_off, d_len) slice contains the already-JSON-escaped payload between
+// the surrounding quotes — identical shape to hub_parse_cast_line_'s
+// output, so the downstream coalesce/budget/JSON-build path is
+// format-agnostic from this point on.
+static bool hub_parse_transcript_line_(const char* line, size_t len,
+                                       char& k, size_t& d_off, size_t& d_len) {
+    if (len < 4) return false;
+    char dir = line[0];
+    if (line[1] != ':' || line[2] != '"') return false;
+    if      (dir == 'S') k = 'o';
+    else if (dir == 'O') k = 'i';
+    else return false;
+    d_off = 3;
+    size_t i = d_off;
+    while (i < len) {
+        if (line[i] == '"') {
+            size_t bs = 0, p = i;
+            while (p > d_off && line[p - 1] == '\\') { bs++; p--; }
+            if ((bs & 1) == 0) {
+                d_len = i - d_off;
+                return true;
+            }
+        }
+        i++;
+    }
+    return false;
+}
+
 // Parse one event line of an asciicast v2 file:
 //   [<time>,"<k>","<escaped-data>"]
 // Returns false on malformed input. `k` receives 'i' or 'o'; (d_off, d_len)
@@ -562,6 +594,17 @@ static bool hub_parse_cast_line_(const char* line, size_t len,
 // Sets `truncated` if any spec cap (per-event size, total bytes, event
 // count) was hit. Consecutive same-direction events are coalesced — spec
 // §3.4.3 recommends one event per direction-change.
+//
+// Accepts both on-disk formats produced by the recorder (selected at
+// firmware build time via HONEYOPUS_USE_TRANSCRIPT):
+//   - asciicast v2  — first non-blank byte is `{`; one JSON header line
+//                     followed by `[t,"k","d"]` event lines.
+//   - HONEYOPUS-TRANSCRIPT/1 — first non-blank byte is `H`; key:value
+//                     header lines, blank-line separator, then
+//                     `S:"…"` / `O:"…"` body lines.
+// The wire-format `events[]` shape is identical regardless of source so
+// the hub side does not need to know which the device wrote. Any other
+// leading byte yields an empty result (legacy/corrupt file).
 static String hub_build_events_(const String& cast_path,
                                 size_t budget_bytes,
                                 bool& truncated) {
@@ -569,13 +612,27 @@ static String hub_build_events_(const String& cast_path,
     if (!cast_path.length() || budget_bytes == 0) return String();
     // Silent existence check first — calling LittleFS.open(path, "r")
     // when the file isn't there logs a noisy "[E] vfs_api.cpp:105
-    // ... no permits for creation" line. Asciinema::begin() can fail
-    // to actually create the cast file under LittleFS pressure, but
-    // entry.cast_path is still populated, so this path fires
+    // ... no permits for creation" line. The recorder's begin() can
+    // fail to actually create the cast file under LittleFS pressure,
+    // but entry.cast_path is still populated, so this path fires
     // routinely and is not an error condition.
     if (!fs_exists_silent(cast_path.c_str())) return String();
     File f = LittleFS.open(cast_path, "r");
     if (!f) return String();
+
+    // Format probe: skip any leading newlines, then peek the first real
+    // byte. Leaves the file pointer ON that byte so the main loop reads
+    // it as part of line 1.
+    int peek = -1;
+    while (f.available()) {
+        peek = f.peek();
+        if (peek != '\n' && peek != '\r') break;
+        f.read();
+    }
+    bool is_transcript;
+    if      (peek == '{') is_transcript = false;
+    else if (peek == 'H') is_transcript = true;
+    else { f.close(); return String(); }
 
     String out;
     out.reserve(budget_bytes < 2048 ? 1024 : (budget_bytes / 2));
@@ -613,7 +670,11 @@ static String hub_build_events_(const String& cast_path,
     };
 
     char buf[2048];
-    bool first_line = true;
+    // header_done flips when we've consumed the format-specific header:
+    //   asciicast — exactly one line (`{...}`)
+    //   transcript — every line up to and including the blank separator
+    bool header_done = false;
+    bool asciicast_first_line = true;
     while (f.available()) {
         size_t off = 0;
         while (off + 1 < sizeof(buf) && f.available()) {
@@ -623,12 +684,27 @@ static String hub_build_events_(const String& cast_path,
             buf[off++] = (char)c;
         }
         buf[off] = 0;
-        if (first_line) { first_line = false; continue; }   // skip header
+        if (!header_done) {
+            if (is_transcript) {
+                // Blank line ends the transcript header.
+                if (off == 0) header_done = true;
+                continue;
+            }
+            // Asciicast: skip exactly the first (header) line.
+            if (asciicast_first_line) {
+                asciicast_first_line = false;
+                header_done = true;
+                continue;
+            }
+        }
         if (off == 0) continue;
 
         char   k;
         size_t d_off, d_len;
-        if (!hub_parse_cast_line_(buf, off, k, d_off, d_len)) continue;
+        bool ok = is_transcript
+                  ? hub_parse_transcript_line_(buf, off, k, d_off, d_len)
+                  : hub_parse_cast_line_(buf, off, k, d_off, d_len);
+        if (!ok) continue;
         if (d_len == 0) continue;
 
         if (total_d + d_len > budget_bytes) { truncated = true; break; }
