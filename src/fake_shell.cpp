@@ -2250,12 +2250,29 @@ String FakeShell::cmdDd_(Cmd& c) {
     //   1+0 records in
     //   1+0 records out
     //   52 bytes copied, 0.000123 s, 421 kB/s
+    //
+    // Synthesise plausible-but-varying time / throughput rather
+    // than the hardcoded "0.000123 s, 421 kB/s" — bots that run
+    // dd repeatedly and compare outputs would otherwise fingerprint
+    // the constant. We pretend a 1-MB/s write rate (slow flash, NVR
+    // class) with a small per-call jitter.
     uint32_t bytes = (cnt > 0) ? (bs * cnt) : bs;
+    // ~1 MB/s with ±12 % jitter from a hash of bytes + millis.
+    uint32_t jitter = ((bytes * 2654435761u) ^ (uint32_t)millis()) & 0xff;
+    uint32_t kbps   = 900 + (jitter % 240);            // 900..1140 kB/s
+    uint32_t us     = (uint32_t)((uint64_t)bytes * 1000u / kbps); // micros at that rate
+    if (us == 0) us = 1;
+    char tail[64];
+    snprintf(tail, sizeof(tail), "%u bytes copied, %u.%06u s, %u.%u kB/s\n",
+             (unsigned)bytes,
+             (unsigned)(us / 1000000u),
+             (unsigned)(us % 1000000u),
+             (unsigned)(kbps / 10), (unsigned)(kbps % 10));
     String out;
     out.reserve(96);
     out += String(cnt > 0 ? cnt : 1) + "+0 records in\n";
     out += String(cnt > 0 ? cnt : 1) + "+0 records out\n";
-    out += String(bytes) + " bytes copied, 0.000123 s, 421 kB/s\n";
+    out += tail;
     return out;
 }
 

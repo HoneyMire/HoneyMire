@@ -75,7 +75,11 @@ public:
     // are millis() timestamps of the first/last accepted command (0 if none).
     uint32_t firstCmdMs() const { return first_cmd_ms_; }
     uint32_t lastCmdMs()  const { return last_cmd_ms_;  }
-    String   commandSummary(size_t max_bytes = 1500) const;
+    // Default cap chosen to fit the AbuseIPDB / OTX comment limit
+    // (~4 KB) and the hub's command_summary column comfortably while
+    // still giving the classifier enough tail context for sessions
+    // that ran dozens of distinct commands. Was 1500.
+    String   commandSummary(size_t max_bytes = 4000) const;
 
     // Session caps from NEW.md "Safety Rules". When sessionLimitsExceeded()
     // becomes true the caller (telnet/ssh runner) should drop the connection.
