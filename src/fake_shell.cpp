@@ -848,6 +848,7 @@ String FakeShell::runWithRedirects_(Cmd& c) {
 
 String FakeShell::runOne_(Cmd& c) {
     last_status_ok_ = true;
+    last_was_unknown_cmd_ = false;
     const String& e = c.exe;
 
     // BusyBox aliasing: "busybox <cmd> ..." -> shift. If <cmd> isn't a real
@@ -867,10 +868,14 @@ String FakeShell::runOne_(Cmd& c) {
         c.argv.erase(c.argv.begin());
         c.exe = normalizeExe_(c.argv[0]);
         String r = runOne_(c);
-        // If the inner dispatch fell through to the bash not-found message,
-        // rewrite it as the BusyBox applet-not-found line. last_status_ok_
-        // remains false either way.
-        if (!last_status_ok_ && r.startsWith("-bash:")) {
+        // If the inner dispatch fell through to the persona's
+        // not-found path (NOT a real applet error), rewrite as the
+        // BusyBox applet-not-found line — that's what real
+        // `busybox <unknown>` prints regardless of the surrounding
+        // shell. We use last_was_unknown_cmd_ rather than just
+        // last_status_ok_ so a real applet that ran and emitted its
+        // own "<applet>: <error>" passes through verbatim.
+        if (last_was_unknown_cmd_) {
             return applet + ": applet not found\n";
         }
         return r;
@@ -987,9 +992,25 @@ String FakeShell::runOne_(Cmd& c) {
     // Fake top one-shot — bots use `top -bn1` for recon.
     if (e=="top") return cmdTop_(c);
 
-    // not found
+    // not found — use the persona's shell-specific format.
+    // bash:    "-bash: <cmd>: command not found"
+    // ash:     "<cmd>: not found"   (BusyBox / OpenWrt)
+    // RouterOS: "bad command name <cmd> (line 1 column 1)"
+    // …etc. See PersonaProfile::not_found_fmt.
     last_status_ok_ = false;
-    return "-bash: " + c.argv[0] + ": command not found\n";
+    last_was_unknown_cmd_ = true;
+    const auto& profile = telnet_persona_profile(persona_);
+    const char* fmt = profile.not_found_fmt
+                          ? profile.not_found_fmt
+                          : "-bash: %s: command not found\n";
+    char buf[160];
+    // Cap the cmd-name interpolation so an attacker pasting a 4 KB
+    // "command" (real case: garbage from a binary echo) can't blow
+    // the stack buffer.
+    String name = c.argv[0];
+    if (name.length() > 96) name = name.substring(0, 96);
+    snprintf(buf, sizeof(buf), fmt, name.c_str());
+    return String(buf);
 }
 
 // ===================== individual commands =====================

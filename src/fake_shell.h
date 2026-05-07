@@ -227,6 +227,13 @@ private:
     String crontab_;
 
     bool last_status_ok_ = true;
+    // Set true when runOne_ falls through to the persona's
+    // "command not found" path. Used by the `busybox <applet>`
+    // dispatcher to distinguish "unknown applet" from "applet ran
+    // and emitted its own error" — the former gets rewritten as
+    // BusyBox's "applet not found" line, the latter passes through
+    // verbatim.
+    bool last_was_unknown_cmd_ = false;
 };
 
 } // namespace honeyopus

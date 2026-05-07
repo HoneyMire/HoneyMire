@@ -10,7 +10,8 @@ static const PersonaProfile profiles[] = {
         "%s login: ",
         nullptr,
         "ubuntu-server",
-        "ubuntu"
+        "ubuntu",
+        "-bash: %s: command not found\n",
     },
     {
         TelnetPersona::BusyBox,
@@ -18,7 +19,9 @@ static const PersonaProfile profiles[] = {
         "%s login: ",
         "BusyBox v1.35.0 (2022-12-01) built-in shell (ash)\nEnter 'help' for a list of built-in commands.",
         "router",
-        "admin"
+        "admin",
+        // BusyBox /bin/sh (ash) — terse, no leading shell name.
+        "%s: not found\n",
     },
     {
         TelnetPersona::RouterOS,
@@ -26,7 +29,9 @@ static const PersonaProfile profiles[] = {
         "[%s] > ",  // RouterOS uses > not login:
         nullptr,
         "MikroTik",
-        "admin"
+        "admin",
+        // RouterOS console — diagnostic-heavy.
+        "bad command name %s (line 1 column 1)\n",
     },
     {
         TelnetPersona::OpenWrt,
@@ -34,7 +39,9 @@ static const PersonaProfile profiles[] = {
         "%s login: ",
         nullptr,
         "OpenWrt",
-        "root"
+        "root",
+        // OpenWrt default shell is BusyBox ash.
+        "%s: not found\n",
     },
     {
         TelnetPersona::DVRDVS,
@@ -42,7 +49,9 @@ static const PersonaProfile profiles[] = {
         "%s login: ",
         "DVRDVS DVR System\nType ? for help",
         "DVRDVS",
-        "admin"
+        "admin",
+        // DVR firmware shells typically just echo a generic error.
+        "Unknown command: %s\n",
     },
     {
         TelnetPersona::HiLinux,
@@ -50,7 +59,9 @@ static const PersonaProfile profiles[] = {
         "(%s) login: ",
         nullptr,
         "hilinux-nvrbox",
-        "root"
+        "root",
+        // HiLinux NVR firmwares usually present an ash-like sh.
+        "-sh: %s: not found\n",
     }
 };
 

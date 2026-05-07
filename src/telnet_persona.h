@@ -22,6 +22,16 @@ struct PersonaProfile {
     const char* post_login_msg;  // NULL = no message
     const char* hostname;        // Default: "localhost"
     const char* fake_user;       // Default: "root"
+    // Format string for unknown-command output, with one %s for the
+    // command name. Real shells differ visibly here:
+    //   bash:     "-bash: <cmd>: command not found\n"
+    //   ash:      "<cmd>: not found\n"        (BusyBox / OpenWrt)
+    //   busybox:  "<cmd>: applet not found\n" (busybox <applet> form,
+    //                                          handled separately)
+    //   RouterOS: "bad command name <cmd> (line 1 column 1)\n"
+    // Bots fingerprint on this; getting it right per persona is
+    // cheap credibility. NULL falls back to the bash form.
+    const char* not_found_fmt;
 };
 
 // Select a random persona; call once per telnet session.
