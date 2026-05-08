@@ -634,6 +634,22 @@ static void ssh_listener_task(void*) {
                 tv.tv_usec = 0;
                 setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                // Enable TCP keepalive on the accepted socket. The 15 s
+                // application-level idle timer already covers the
+                // common slow-loris case (peer completes TCP, then sends
+                // nothing), but keepalive layers on a kernel-level dead-
+                // peer detector for the case where the listener task
+                // wedges briefly: 60 s idle → first probe, 15 s intervals,
+                // give up after 4 misses → connection closed in ~2 min
+                // even if the app loop never gets back to it. Default
+                // lwIP keepalive (without tuning) is 2 hours, which is
+                // useless for a honeypot.
+                int on = 1;
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+                int idle = 60, intvl = 15, cnt = 4;
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
             }
         }
         // Gate at the door: drop repeat attackers BEFORE letting libssh
