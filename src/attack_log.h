@@ -56,6 +56,15 @@ class AttackLog {
 public:
     bool begin();
     uint32_t nextId();
+    // Bump next_id_ to at_least if it's currently lower. Used by the
+    // hub-relay path to recover from id-counter drift after a flash
+    // erase: when the hub's response says max_hp_local_id is higher
+    // than what we'd hand out next, our local counter has fallen
+    // behind (LittleFS / NVS shadow got wiped), and every future
+    // ingest would silently ON-CONFLICT-dedup against an old row.
+    // The persister task picks up the new high-water on its next
+    // sweep and flushes NVS — same path as a regular allocation.
+    void bumpNextIdAtLeast(uint32_t at_least);
     void append(const AttackEntry& e);
     void update(const AttackEntry& e);            // replace-by-id in cache + append delta line
     std::vector<AttackEntry> recent(size_t limit);

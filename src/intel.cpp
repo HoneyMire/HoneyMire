@@ -966,8 +966,33 @@ bool intel_report_hub(AttackEntry& e) {
 
     if (code >= 200 && code < 300) {
         e.reported_hub = true;
-        Serial.printf("[hub] %s id=%u reported, http=%d (%u B body)\n",
-                      e.ip.c_str(), (unsigned)e.id, code, (unsigned)body.length());
+        // Parse the hub's response for max_hp_local_id and bump our
+        // local next_id_ counter past any drift. The drift case in
+        // the wild: a `pio run -t uploadfs` or `esptool erase_flash`
+        // wipes LittleFS / NVS, our next_id_ resets to 1, but the
+        // DB still has rows with hp_local_id 1..N — so every
+        // subsequent ingest silently ON-CONFLICT-dedups against an
+        // old row. With max_hp_local_id returned in every 2xx,
+        // we self-heal on the very next report and future ingests
+        // land cleanly. dedup:true also surfaces in the log so the
+        // operator sees what just happened.
+        bool dedup = false;
+        uint32_t max_hp_local_id = 0;
+        if (resp.length()) {
+            JsonDocument rd;
+            if (deserializeJson(rd, resp) == DeserializationError::Ok) {
+                dedup = rd["dedup"] | false;
+                if (rd["max_hp_local_id"].is<uint32_t>()) {
+                    max_hp_local_id = rd["max_hp_local_id"].as<uint32_t>();
+                }
+            }
+        }
+        if (max_hp_local_id > 0) {
+            g_attack_log.bumpNextIdAtLeast(max_hp_local_id + 1);
+        }
+        Serial.printf("[hub] %s id=%u reported, http=%d (%u B body)%s\n",
+                      e.ip.c_str(), (unsigned)e.id, code, (unsigned)body.length(),
+                      dedup ? " DEDUP" : "");
         return true;
     }
     // Spec §4: 4xx (other than 429) are permanent — don't retry. Mark as

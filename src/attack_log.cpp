@@ -195,6 +195,18 @@ uint32_t AttackLog::nextId() {
     return id;
 }
 
+void AttackLog::bumpNextIdAtLeast(uint32_t at_least) {
+    LogLock lk(mtx_);
+    if (at_least > next_id_) {
+        Serial.printf("[log] next_id_ bumped %u -> %u (hub watermark)\n",
+                      (unsigned)next_id_, (unsigned)at_least);
+        next_id_ = at_least;
+        // No NVS write here — same hot-path reasoning as nextId().
+        // The persister task wakes ~5 s later, sees cur_next_id !=
+        // last_persisted_next_id, and flushes the shadow.
+    }
+}
+
 void AttackLog::persistAppend_(const AttackEntry& e) {
     // Under extreme heap pressure (typically right after a failed mbedTLS
     // handshake) LittleFS.open can return a File whose underlying lfs_file
