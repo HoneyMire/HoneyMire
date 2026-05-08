@@ -941,6 +941,180 @@ static void send_play_page(AsyncWebServerRequest* req) {
     req->send(s);
 }
 
+// Build an asciicast v2 byte stream from a HONEYOPUS-TRANSCRIPT/1 file,
+// appending one segment per logical event into `segs`. Mirrors the JS
+// algorithm in transcriptToCast() (see send_play_page) and the
+// source-of-truth HoneyOpusHUB/src/lib/cast.ts::eventsToCastV2 — same
+// constants, same CR/LF/CRLF coalescing, same lastWasInput pacing.
+//
+// The transcript body is already strict-ASCII JSON-escaped (per
+// Transcript::writeEscapedJsonString_), so the per-char slices we
+// extract here can be embedded verbatim inside another JSON string —
+// no decode/re-escape pass is needed. Each iteration step identifies
+// one logical character by walking the escape forms:
+//   "\\uXXXX"  → 6 chars  (one logical char)
+//   "\\X"      → 2 chars  (one logical char; \\r and \\n are newlines)
+//   single byte→ 1 char
+// CR/LF/CRLF runs are coalesced into a single emit so ENTER feels like
+// one keystroke rather than two ticks of the typing cadence.
+//
+// Returns false on malformed file / open failure / missing magic.
+static bool build_cast_from_transcript_(const String& path,
+                                        std::vector<String>& segs) {
+    File f = LittleFS.open(path, "r");
+    if (!f) return false;
+
+    String hdr_persona, hdr_proto, hdr_ts;
+    uint16_t hdr_cols = 80, hdr_rows = 24;
+    bool seen_magic = false;
+    bool header_done = false;
+
+    char lbuf[2048];
+    auto read_line = [&](size_t& out_off) -> bool {
+        out_off = 0;
+        if (!f.available()) return false;
+        while (out_off + 1 < sizeof(lbuf) && f.available()) {
+            int c = f.read();
+            if (c < 0) break;
+            if (c == '\n') { lbuf[out_off] = 0; return true; }
+            lbuf[out_off++] = (char)c;
+        }
+        lbuf[out_off] = 0;
+        return out_off > 0 || !f.available();   // last partial line still OK
+    };
+
+    {
+        size_t off;
+        while (!header_done && read_line(off)) {
+            if (!seen_magic) {
+                if (off < strlen("HONEYOPUS-TRANSCRIPT/") ||
+                    strncmp(lbuf, "HONEYOPUS-TRANSCRIPT/", strlen("HONEYOPUS-TRANSCRIPT/")) != 0) {
+                    f.close(); return false;
+                }
+                seen_magic = true;
+                continue;
+            }
+            if (off == 0) { header_done = true; break; }
+            // Find first ':' separator.
+            size_t col = 0;
+            while (col < off && lbuf[col] != ':') col++;
+            if (col == 0 || col >= off) continue;
+            String k(lbuf, col);
+            String v(&lbuf[col + 1]);
+            if      (k == "persona") hdr_persona = v;
+            else if (k == "proto")   hdr_proto   = v;
+            else if (k == "ts")      hdr_ts      = v;
+            else if (k == "cols")    hdr_cols    = (uint16_t)v.toInt();
+            else if (k == "rows")    hdr_rows    = (uint16_t)v.toInt();
+        }
+    }
+    if (!seen_magic) { f.close(); return false; }
+
+    // Asciicast v2 header line.
+    {
+        String h;
+        h.reserve(192);
+        h += "{\"version\":2,\"width\":";
+        h += hdr_cols;
+        h += ",\"height\":";
+        h += hdr_rows;
+        h += ",\"env\":{\"SHELL\":\"/bin/bash\",\"TERM\":\"xterm-256color\"}";
+        if (hdr_persona.length()) {
+            // hdr_persona originates from telnet_persona_name — ASCII —
+            // so embedding without escape is safe.
+            h += ",\"title\":\"Session \\u2014 ";
+            h += hdr_persona;
+            h += "\"";
+        }
+        // ts→timestamp omitted: would require an ISO-8601 parser.
+        // The asciinema player tolerates absence, and the hub already
+        // has the wall-clock time in attack.ts.
+        h += "}\n";
+        segs.emplace_back(std::move(h));
+    }
+
+    // Synthetic timings (ms). MUST match transcriptToCast / cast.ts.
+    constexpr uint32_t T_INITIAL_OUT  = 60;
+    constexpr uint32_t T_OUT          = 30;
+    constexpr uint32_t T_INPUT_PAUSE  = 350;
+    constexpr uint32_t T_AFTER_INPUT  = 40;
+    constexpr uint32_t T_TYPING_CHAR  = 70;
+    constexpr uint32_t T_NEWLINE      = 90;
+
+    uint32_t tMs = 0;
+    bool last_was_input = false;
+
+    auto append_event = [](String& seg, uint32_t t_ms,
+                           const char* slice, size_t slen) {
+        char tbuf[24];
+        snprintf(tbuf, sizeof(tbuf), "%.3f", t_ms / 1000.0);
+        seg += '[';
+        seg += tbuf;
+        seg += ",\"o\",\"";
+        seg.concat(slice, slen);
+        seg += "\"]\n";
+    };
+
+    while (f.available()) {
+        size_t off = 0;
+        while (off + 1 < sizeof(lbuf) && f.available()) {
+            int c = f.read();
+            if (c < 0) break;
+            if (c == '\n') break;
+            lbuf[off++] = (char)c;
+        }
+        if (off < 4) continue;
+        char dir = lbuf[0];
+        if (lbuf[1] != ':' || lbuf[2] != '"' || lbuf[off - 1] != '"') continue;
+        if (dir != 'S' && dir != 'O') continue;
+        const char* body = &lbuf[3];
+        size_t      blen = off - 4;          // strip both surrounding quotes
+
+        if (dir == 'S') {
+            tMs += (tMs == 0) ? T_INITIAL_OUT
+                              : (last_was_input ? T_AFTER_INPUT : T_OUT);
+            String seg;
+            seg.reserve(blen + 24);
+            append_event(seg, tMs, body, blen);
+            segs.emplace_back(std::move(seg));
+            last_was_input = false;
+        } else {
+            tMs += T_INPUT_PAUSE;
+            String seg;
+            seg.reserve(blen * 24 + 32);   // rough; per-char emit dominates
+            size_t i = 0;
+            while (i < blen) {
+                size_t slen;
+                bool is_esc = (body[i] == '\\' && i + 1 < blen);
+                if (is_esc && body[i + 1] == 'u' && i + 5 < blen) slen = 6;
+                else if (is_esc)                                  slen = 2;
+                else                                              slen = 1;
+                bool is_nl = is_esc && slen == 2 &&
+                             (body[i + 1] == 'r' || body[i + 1] == 'n');
+                if (is_nl) {
+                    size_t end = i + slen;
+                    // Coalesce \r\n into one emit.
+                    if (body[i + 1] == 'r' && end + 1 < blen &&
+                        body[end] == '\\' && body[end + 1] == 'n') {
+                        end += 2;
+                    }
+                    tMs += T_NEWLINE;
+                    append_event(seg, tMs, &body[i], end - i);
+                    i = end;
+                    continue;
+                }
+                append_event(seg, tMs, &body[i], slen);
+                i += slen;
+                if (i < blen) tMs += T_TYPING_CHAR;
+            }
+            if (seg.length()) segs.emplace_back(std::move(seg));
+            last_was_input = true;
+        }
+    }
+    f.close();
+    return true;
+}
+
 static void send_cast(AsyncWebServerRequest* req) {
     if (!authed(req)) return req->requestAuthentication();
     if (!req->hasParam("id")) { req->send(400, "text/plain", "missing id"); return; }
@@ -949,16 +1123,56 @@ static void send_cast(AsyncWebServerRequest* req) {
     if (!g_attack_log.getById(id, e) || !e.cast_path.length() || !LittleFS.exists(e.cast_path)) {
         req->send(404, "text/plain", "not found"); return;
     }
-    // Stream straight from LittleFS — the framework's
-    // beginResponse(FS, path, ...) opens the file, pushes it through
-    // AsyncTCP in lwIP-friendly chunks, and closes on completion. No
-    // body String, no body.reserve(sz+1) → no OOM hazard regardless
-    // of file size. Replaces the prior slurp that could call the
-    // global new_handler on any cast over ~70 KiB on a heap-tight
-    // C3. See ESP32 stability review E2.
     bool dl = req->hasParam("dl");
+
+    // Detect on-disk format from the first non-whitespace byte:
+    //   '{' → legacy asciicast v2: stream verbatim from LittleFS via
+    //         the framework's lwIP-friendly file responder. No body
+    //         String → no OOM hazard regardless of file size.
+    //   'H' → HONEYOPUS-TRANSCRIPT/1: synthesise an asciicast v2
+    //         stream on the fly so `asciinema play` and other CLI
+    //         consumers keep working without round-tripping through
+    //         the player JS.
+    char first = 0;
+    {
+        File pf = LittleFS.open(e.cast_path, "r");
+        if (pf) {
+            while (pf.available()) {
+                int b = pf.read();
+                if (b < 0) break;
+                if (b == ' ' || b == '\t' || b == '\n' || b == '\r') continue;
+                first = (char)b; break;
+            }
+            pf.close();
+        }
+    }
+
+    if (first != 'H') {
+        // Stream straight from LittleFS — the framework's
+        // beginResponse(FS, path, ...) opens the file, pushes it
+        // through AsyncTCP in lwIP-friendly chunks, and closes on
+        // completion. Replaces the prior slurp that could call the
+        // global new_handler on any cast over ~70 KiB on a heap-
+        // tight C3. See ESP32 stability review E2.
+        AsyncWebServerResponse* r =
+            req->beginResponse(LittleFS, e.cast_path, "application/x-asciicast", dl);
+        r->addHeader("Cache-Control", "no-store");
+        if (dl) {
+            String fn = e.cast_path.substring(e.cast_path.lastIndexOf('/') + 1);
+            r->addHeader("Content-Disposition", String("attachment; filename=\"") + fn + "\"");
+        }
+        req->send(r);
+        return;
+    }
+
+    // Transcript → asciicast v2 on the fly.
+    auto pg = std::make_shared<SegPage>();
+    if (!build_cast_from_transcript_(e.cast_path, pg->segs)) {
+        req->send(500, "text/plain", "transcript decode failed");
+        return;
+    }
     AsyncWebServerResponse* r =
-        req->beginResponse(LittleFS, e.cast_path, "application/x-asciicast", dl);
+        req->beginChunkedResponse("application/x-asciicast", make_seg_filler(pg));
     r->addHeader("Cache-Control", "no-store");
     if (dl) {
         String fn = e.cast_path.substring(e.cast_path.lastIndexOf('/') + 1);
