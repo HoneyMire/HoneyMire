@@ -272,7 +272,11 @@ static void handle_session(ssh_session sess) {
     auto idle_alive = [&]() {
         return (millis() - last_activity_ms) < kSshIdleTimeoutMs;
     };
-    while (!authed && attempts < cfg.login_attempts_before_accept + 5 &&
+    // Cap total password tries at login_attempts_before_accept + 3 so the
+    // wall (default 3 + 3 = 6) matches real OpenSSH's MaxAuthTries default
+    // of 6. The previous +5 (cap=8) was a fingerprintable tell vs a real
+    // sshd; bots that count rejection responses see a difference.
+    while (!authed && attempts < cfg.login_attempts_before_accept + 3 &&
            ssh_is_connected(sess) && idle_alive()) {
         ssh_message msg = ssh_message_get(sess);
         if (!msg) break;
