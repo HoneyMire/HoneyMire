@@ -9,6 +9,19 @@ namespace honeyopus {
 // Header is the first line as a single-line JSON object, then events follow:
 //   [time_offset, "o" | "i", "data"]
 // where data is JSON-string-escaped UTF-8.
+//
+// DEPRECATED post-TX (2026-05-08). The on-device session storage path now
+// dispatches via src/recorder.h to the plain-text Transcript writer when
+// the firmware is built with HONEYOPUS_USE_TRANSCRIPT defined; default
+// builds still instantiate Asciinema, so this class stays in the tree
+// for one soak cycle. After HONEYOPUS_USE_TRANSCRIPT is flipped
+// default-on in platformio.ini and a release ships, the class can be
+// removed along with src/asciinema.cpp; the read-side dual-format
+// parsers (intel.cpp::hub_build_events_, web_dashboard.cpp::send_cast,
+// the /play page JS) keep working with legacy `.cast` files written by
+// older firmware in the field, so the read paths must outlive this
+// writer. See docs/PLAN_PLAINTEXT_TRANSCRIPT.md for the full migration
+// plan and which downstream consumers anchor the format choice.
 class Asciinema {
 public:
     bool begin(const String& path,
