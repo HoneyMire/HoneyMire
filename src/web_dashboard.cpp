@@ -841,24 +841,92 @@ static void send_play_page(AsyncWebServerRequest* req) {
              "if(c)c.innerHTML='<p style=\"color:#e94560\">Player error: '"
              "+(ev.reason&&ev.reason.message?ev.reason.message:String(ev.reason))+'</p>';"
              "});");
-    // Transform each event line of the cast: rewrite kind 'i' → 'o' so
-    // asciinema-player actually renders attacker-typed lines. The player
-    // only paints 'o' (output) events on playback; in a real recording
-    // the typed text shows up in 'o' because the terminal echoes it.
-    // Our firmware deliberately does NOT record per-char echo (would
-    // produce a useless i,o,i,o,… alternation), so without this rewrite
-    // the local player would skip every typed line and the session
-    // appears with the credentials/commands missing — exactly the same
-    // failure mode the hub had before its own i→o flip. The forensic
-    // i/o distinction is preserved on the hub side via the events[]
-    // payload extracted from the same cast file.
+    // transcriptToCast — port of HoneyOpusHUB src/lib/cast.ts::eventsToCastV2.
+    // Input: full body of a HONEYOPUS-TRANSCRIPT/1 file.
+    // Output: an asciicast v2 string ready for AsciinemaPlayer.create.
+    // Synthetic timings match the hub: T_INITIAL_OUT=60, T_OUT=30,
+    // T_INPUT_PAUSE=350, T_AFTER_INPUT=40, T_TYPING_CHAR=70, T_NEWLINE=90 ms.
+    // Input events expanded per-character into 'o' cast events so the
+    // asciinema-player actually renders typed text (it skips 'i' on
+    // playback). Same reason as the asciicast-branch i→o rewrite below.
+    s->print("function transcriptToCast(txt){"
+             "var lines=txt.split('\\n');"
+             "var idx=0;"
+             "if(lines[0]&&lines[0].indexOf('HONEYOPUS-TRANSCRIPT/')===0)idx=1;"
+             "var hdr={},bodyStart=-1;"
+             "for(;idx<lines.length;idx++){"
+             "if(lines[idx]===''){bodyStart=idx+1;break;}"
+             "var c=lines[idx].indexOf(':');"
+             "if(c>0)hdr[lines[idx].substring(0,c)]=lines[idx].substring(c+1);"
+             "}"
+             "if(bodyStart<0)return '';"
+             "var ev=[];"
+             "for(var k=bodyStart;k<lines.length;k++){"
+             "var L=lines[k];"
+             "if(!L||L.length<4)continue;"
+             "var dir=L[0];"
+             "if(L[1]!==':'||L[2]!=='\"')continue;"
+             "if(dir!=='S'&&dir!=='O')continue;"
+             "var q=L.substring(2);"
+             "if(q.charAt(q.length-1)!=='\"')continue;"
+             "try{var d=JSON.parse(q);ev.push({k:dir==='S'?'o':'i',d:d});}catch(e){}"
+             "}"
+             "var cols=parseInt(hdr.cols||'80',10)||80;"
+             "var rows=parseInt(hdr.rows||'24',10)||24;"
+             "var head={version:2,width:cols,height:rows,"
+             "env:{SHELL:'/bin/bash',TERM:'xterm-256color'}};"
+             "if(hdr.persona)head.title='Session \\u2014 '+hdr.persona;"
+             "if(hdr.ts){var ts=Date.parse(hdr.ts);"
+             "if(!isNaN(ts)&&ts>1700000000000)head.timestamp=Math.floor(ts/1000);}"
+             "var out=JSON.stringify(head)+'\\n';"
+             "var tMs=0,lastIn=false;"
+             "function emit(kk,dd){var t=(tMs/1000).toFixed(3);"
+             "out+='['+t+','+JSON.stringify(kk)+','+JSON.stringify(dd)+']\\n';}"
+             "for(var ix=0;ix<ev.length;ix++){"
+             "var e=ev[ix];"
+             "if(typeof e.d!=='string'||!e.d.length)continue;"
+             "if(e.k==='i'){"
+             "tMs+=350;"
+             "var chars=Array.from(e.d);"
+             "var j=0;"
+             "while(j<chars.length){"
+             "if(chars[j]==='\\r'||chars[j]==='\\n'){"
+             "var nl=chars[j];"
+             "if(chars[j]==='\\r'&&chars[j+1]==='\\n'){nl='\\r\\n';j+=2;}else{j+=1;}"
+             "tMs+=90;emit('o',nl);continue;"
+             "}"
+             "emit('o',chars[j]);j+=1;"
+             "if(j<chars.length)tMs+=70;"
+             "}"
+             "lastIn=true;"
+             "}else{"
+             "tMs+=tMs===0?60:(lastIn?40:30);"
+             "emit('o',e.d);lastIn=false;"
+             "}"
+             "}"
+             "return out;"
+             "}");
+    // Fetch the cast file, dispatch on its first non-whitespace byte:
+    //   '{' → asciicast v2: rewrite each `[t,"i",...]` event line to 'o'
+    //         so asciinema-player renders attacker-typed lines (the player
+    //         skips 'i' on playback; in a real recording the terminal
+    //         echoes typed text into 'o', and our firmware deliberately
+    //         does NOT record per-char echo because that would produce a
+    //         useless i,o,i,o,… alternation). The forensic i/o split is
+    //         preserved on the hub side via attack.session.events[].
+    //   'H' → HONEYOPUS-TRANSCRIPT/1: reconstruct an asciicast v2 string
+    //         in-browser via transcriptToCast.
     s->printf("var cont=document.getElementById('player');"
               "fetch('/cast?id=%u',{credentials:'same-origin',cache:'no-store'})"
               ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.text();})"
               ".then(function(data){"
-              "data=data.split('\\n').map(function(L){"
+              "var i=0,c='';"
+              "while(i<data.length){c=data.charAt(i);"
+              "if(c!==' '&&c!=='\\n'&&c!=='\\r'&&c!=='\\t')break;i++;}"
+              "if(c==='H'){data=transcriptToCast(data);}"
+              "else{data=data.split('\\n').map(function(L){"
               "return L&&L[0]==='['?L.replace(/^(\\[[0-9.]+,)\"i\"(,)/,'$1\"o\"$2'):L;"
-              "}).join('\\n');"
+              "}).join('\\n');}"
               "cont.innerHTML='';"
               "try{AsciinemaPlayer.create({data:data},cont,"
               "{autoPlay:true,fit:'width',terminalFontSize:'11px',terminalLineHeight:1.2,idleTimeLimit:2});}"
