@@ -658,14 +658,20 @@ static void tn_on_poll(void* arg, AsyncClient* c) {
     // out_buf empties promptly without tn_send ever blocking the
     // AsyncTCP task.
     tn_pump_out_(s);
-    // Idle timeout — only close if the attacker has stopped sending bytes
-    // for the full window. Resets on every onData (see tn_on_data). An
-    // actively-typing session lives for as long as the attacker keeps
-    // sending; only true silence closes it.
-    constexpr uint32_t kTnIdleTimeoutMs = 15000;
-    if (millis() - s->last_rx_ms > kTnIdleTimeoutMs) {
-        c->close();
-    }
+    // Idle close is owned by telnet_reap (loopTask). Both paths used
+    // to fire at the 15 s mark, racing each other: tn_on_poll's plain
+    // c->close() vs the reaper's K_CLOSE worker job. Both are
+    // currently safe (the H1 idempotent guard + close_attempted flag
+    // make a double-close benign), but having two paths fight for
+    // the same close muddied the Serial log and made WDT triage
+    // harder. The reaper owns idle-close exclusively now: it tracks
+    // stuck_logged / close_attempted, frees the registry slot under
+    // the critical section, and routes close(true) through the
+    // worker so loopTask never blocks on AsyncTCP/lwIP teardown.
+    // tn_on_timeout (AsyncTCP's own idle hook) is still wired and
+    // still drives c->close() on libssh-style TCP timeout — that
+    // path remains the AsyncTCP-internal one, not duplicating the
+    // reaper.
 }
 
 static void tn_on_ack(void* arg, AsyncClient* /*c*/, size_t /*len*/, uint32_t /*time*/) {
