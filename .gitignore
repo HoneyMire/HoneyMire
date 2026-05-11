@@ -35,6 +35,7 @@ secrets.ini
 *.local.ini
 docs/PLAN_PLAINTEXT_TRANSCRIPT.md
 docs/REMAINING_WORK.md
+docs/ESP32_STABILITY_CODE_REVIEW.md
 
 # Web flasher staging (built in CI)
 site/
