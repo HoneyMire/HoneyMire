@@ -174,9 +174,9 @@ never blocked. Each captured attack triggers:
    32 KiB on C3, 64 KiB on T-QT Pro, 96 KiB on N16R8). Configure
    *Hub URL* and *Hub token* in *Config*. Unlike AbuseIPDB/OTX/DShield, the
    Hub **does** receive LAN attacks (so you can validate your setup).
-   Token format is `hop_` + 32 base64url chars; see
-   [`docs/HONEYPOT_PROTOCOL.md`](https://github.com/HoneyMire/HoneyMireHUB/blob/main/docs/HONEYPOT_PROTOCOL.md)
-   in the HoneyMireHUB repo for the wire contract.
+   Token format is `hop_` + 32 base64url chars. 
+   See the [`docs/`](https://honeymire.org/docs) for the protocol and available 
+   client libraries.
 
 The first four are off by default. Enable them in *Config* and paste your
 API keys. **Attacks coming from LAN/private IPs are never reported** to
