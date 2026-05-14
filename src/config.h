@@ -105,7 +105,7 @@ struct Config {
     String dshield_apikey    = "";
 
     // HoneyMire Hub reporter — the project's own ingest endpoint, in
-    // addition to AbuseIPDB / OTX. Spec: docs/INGEST_PROTOCOL.md
+    // addition to AbuseIPDB / OTX. Spec: docs/HONEYPOT_PROTOCOL.md
     // (KaSt/HoneyMireHUB). The hub aggregates this device's attacks
     // alongside the user's other honeypots and renders them on a
     // dashboard. Token format is `hop_` + 32 base64url chars; see §2.

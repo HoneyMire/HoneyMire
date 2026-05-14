@@ -570,7 +570,7 @@ static void send_config_page(AsyncWebServerRequest* req) {
     addF(F("<p class='meta' style='grid-column:1/3;margin:-4px 0 0'>"
            "Attacks coming from LAN/private IPs are never reported to AbuseIPDB, OTX, or DShield. "
            "The Hub <b>does</b> receive LAN attacks (idempotent on attack id). "
-           "See <code>docs/INGEST_PROTOCOL.md</code> in the HoneyMireHUB repo.</p>"));
+           "See <code>docs/HONEYPOT_PROTOCOL.md</code> in the HoneyMireHUB repo.</p>"));
     sec_close();
 
     sec_open("\xE2\x8F\xB0 Time &amp; NTP", false);

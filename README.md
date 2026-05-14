@@ -175,7 +175,7 @@ never blocked. Each captured attack triggers:
    *Hub URL* and *Hub token* in *Config*. Unlike AbuseIPDB/OTX/DShield, the
    Hub **does** receive LAN attacks (so you can validate your setup).
    Token format is `hop_` + 32 base64url chars; see
-   [`docs/INGEST_PROTOCOL.md`](https://github.com/KaSt/HoneyMireHUB/blob/main/docs/INGEST_PROTOCOL.md)
+   [`docs/HONEYPOT_PROTOCOL.md`](https://github.com/KaSt/HoneyMireHUB/blob/main/docs/HONEYPOT_PROTOCOL.md)
    in the HoneyMireHUB repo for the wire contract.
 
 The first four are off by default. Enable them in *Config* and paste your
